@@ -368,7 +368,14 @@ def scan_project_dir(directory: Path) -> dict[str, Path | None]:
         (".kicad_sch", "schematic"),
     ):
         matches = sorted(directory.glob(f"*{extension}"))
-        if matches:
+        if not matches:
+            continue
+        # Board and root schematic share the project's stem; the directory name need not.
+        project = result["project"]
+        project_match = directory / f"{project.stem}{extension}" if project else None
+        if project_match in matches:
+            result[key] = project_match
+        else:
             result[key] = select_canonical_kicad_file(directory, matches, extension)
     return result
 
