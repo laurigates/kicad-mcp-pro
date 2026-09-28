@@ -26,3 +26,37 @@ def test_scan_prefers_canonical_project_over_numbered_duplicate(tmp_path: Path) 
     result = scan_project_dir(project_dir)
 
     assert result["project"] == canonical
+
+
+def test_scan_prefers_board_matching_project_stem(tmp_path: Path) -> None:
+    project_dir = tmp_path / "checkout"
+    project_dir.mkdir()
+    for name in (
+        "mixer.kicad_pro",
+        "archive.kicad_pcb",
+        "mixer-unrouted.kicad_pcb",
+        "mixer.kicad_pcb",
+        "mixer.kicad_sch",
+    ):
+        (project_dir / name).touch()
+
+    result = scan_project_dir(project_dir)
+
+    assert result["project"] == project_dir / "mixer.kicad_pro"
+    assert result["pcb"] == project_dir / "mixer.kicad_pcb"
+
+
+def test_scan_prefers_root_schematic_over_child_sheet(tmp_path: Path) -> None:
+    project_dir = tmp_path / "checkout"
+    project_dir.mkdir()
+    for name in (
+        "mixer.kicad_pro",
+        "mixer.kicad_pcb",
+        "channel_strip.kicad_sch",
+        "mixer.kicad_sch",
+    ):
+        (project_dir / name).touch()
+
+    result = scan_project_dir(project_dir)
+
+    assert result["schematic"] == project_dir / "mixer.kicad_sch"
