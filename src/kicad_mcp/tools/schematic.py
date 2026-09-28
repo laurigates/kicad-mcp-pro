@@ -552,9 +552,15 @@ class _KicadSchApiBackend:
         try:
             symbols: list[dict[str, Any]] = []
             power_symbols: list[dict[str, Any]] = []
+            power_flags = cast(dict[str, bool], compatibility["lib_symbol_power_flags"])
             for component in cast(list[_PlacedComponentLike], list(schematic.components.all())):
                 parsed = _component_to_symbol_dict(component)
-                if parsed["lib_id"].startswith("power:"):
+                # Power symbols are identified by the (power) flag of their embedded
+                # definition; project libraries such as "ecc83-pp:GND" carry it too.
+                is_power = power_flags.get(parsed["lib_id"])
+                if is_power is None:
+                    is_power = parsed["lib_id"].startswith("power:")
+                if is_power:
                     power_symbols.append(parsed)
                 else:
                     symbols.append(parsed)
@@ -1863,7 +1869,26 @@ def _read_schematic_compatibility_data(sch_file: Path) -> dict[str, Any]:
         "wires": _extract_wires(content),
         "labels": _extract_labels(content),
         "buses": _extract_buses(content),
+        "lib_symbol_power_flags": _extract_lib_symbol_power_flags(content),
     }
+
+
+_LIB_SYMBOL_POWER_FLAG = re.compile(r"\(power(?:\s+\w+)?\)")
+_SEXPR_STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
+
+
+def _extract_lib_symbol_power_flags(content: str) -> dict[str, bool]:
+    """Map each embedded ``lib_symbols`` entry to whether it carries KiCad's
+    ``(power)`` / ``(power global)`` / ``(power local)`` flag."""
+    match = re.search(r"\(lib_symbols\b", content)
+    if match is None:
+        return {}
+    block, _ = _extract_block(content, match.start())
+    flags: dict[str, bool] = {}
+    for name, symbol_block in _extract_child_symbol_blocks(block):
+        own_tokens = _SEXPR_STRING.sub('""', _strip_child_symbol_blocks(symbol_block))
+        flags[name] = _LIB_SYMBOL_POWER_FLAG.search(own_tokens) is not None
+    return flags
 
 
 def parse_schematic_file(sch_file: Path) -> dict[str, Any]:
