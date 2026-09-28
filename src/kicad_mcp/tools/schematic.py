@@ -4425,6 +4425,12 @@ def _parse_no_connect_block(block: str) -> dict[str, Any] | None:
     return {"x": float(match.group(1)), "y": float(match.group(2))}
 
 
+def _is_pwr_flag(power_symbol: dict[str, Any]) -> bool:
+    """PWR_FLAG's only pin is power_out: KiCad uses it for ERC and it names no net."""
+    symbol_name = str(power_symbol.get("lib_id", "")).rpartition(":")[2]
+    return "PWR_FLAG" in (symbol_name, str(power_symbol.get("value", "")))
+
+
 def _build_connectivity_groups(sch_file: Path) -> list[dict[str, Any]]:
     data = parse_schematic_file(sch_file)
     try:
@@ -4510,7 +4516,8 @@ def _build_connectivity_groups(sch_file: Path) -> list[dict[str, Any]]:
     for power_symbol in data["power_symbols"]:
         group = ensure_group((float(power_symbol["x"]), float(power_symbol["y"])))
         group["points"].add(_point_key(power_symbol["x"], power_symbol["y"]))
-        group["power"].add(str(power_symbol["value"]))
+        if not _is_pwr_flag(power_symbol):
+            group["power"].add(str(power_symbol["value"]))
 
     for symbol in data["symbols"]:
         library, symbol_name = _split_lib_id(str(symbol["lib_id"]))
