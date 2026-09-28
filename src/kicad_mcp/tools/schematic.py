@@ -3119,7 +3119,7 @@ def _pin_alias_positions(
     fuzzy: dict[str, tuple[float, float]] = {}
     fuzzy_conflicts: set[str] = set()
     for record in _extract_pin_records(block):
-        rx, ry = rotate_point(float(record["x"]), -float(record["y"]), rotation)
+        rx, ry = rotate_point(float(record["x"]), -float(record["y"]), -rotation)
         point = (round(sym_x + rx, 4), round(sym_y + ry, 4))
         number = str(record["number"])
         name = str(record["name"])
@@ -3187,7 +3187,9 @@ def get_pin_positions(
     for block in blocks:
         direct_pins = _extract_pin_definitions(_strip_child_symbol_blocks(block))
         for pin_number, (px, py) in direct_pins.items():
-            rx, ry = rotate_point(px, -py, rotation)
+            # Library Y points up and schematic Y points down, so KiCad's
+            # counter-clockwise symbol rotation is -rotation after the Y flip.
+            rx, ry = rotate_point(px, -py, -rotation)
             pins[pin_number] = (round(sym_x + rx, 4), round(sym_y + ry, 4))
 
         block_name = _symbol_block_name(block)
@@ -3201,7 +3203,7 @@ def get_pin_positions(
                 continue
             for pin_number, (px, py) in _extract_pin_definitions(child_block).items():
                 # KiCad's pin (at x y angle) coordinate is the electrical connection point.
-                rx, ry = rotate_point(px, -py, rotation)
+                rx, ry = rotate_point(px, -py, -rotation)
                 pins[pin_number] = (round(sym_x + rx, 4), round(sym_y + ry, 4))
     return pins
 
