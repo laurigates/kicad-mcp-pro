@@ -3155,8 +3155,7 @@ def _pin_alias_positions(
     fuzzy: dict[str, tuple[float, float]] = {}
     fuzzy_conflicts: set[str] = set()
     for record in _extract_pin_records(block):
-        rx, ry = rotate_point(float(record["x"]), -float(record["y"]), rotation)
-        point = (round(sym_x + rx, 4), round(sym_y + ry, 4))
+        point = _place_pin(float(record["x"]), float(record["y"]), sym_x, sym_y, rotation)
         number = str(record["number"])
         name = str(record["name"])
         for identifier in (number, name, number.casefold(), name.casefold()):

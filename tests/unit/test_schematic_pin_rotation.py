@@ -50,6 +50,19 @@ def test_pin_positions_match_kicad_for_each_rotation(
     assert schematic.get_pin_positions("Device", symbol, 100.0, 100.0, rotation) == expected
 
 
+@pytest.mark.usefixtures("device_library")
+@pytest.mark.parametrize(("symbol", "rotation", "expected"), KICAD_PIN_POSITIONS)
+def test_pin_alias_positions_match_kicad_for_each_rotation(
+    symbol: str, rotation: int, expected: dict[str, tuple[float, float]]
+) -> None:
+    aliases = schematic.get_pin_alias_positions("Device", symbol, 100.0, 100.0, rotation)
+
+    assert {pin: aliases[pin] for pin in expected} == expected
+    if symbol == "LED":
+        assert aliases["K"] == expected["1"]
+        assert aliases["A"] == expected["2"]
+
+
 # KiCad applies (mirror x|y) after rotating; same ERC source as above.
 KICAD_MIRRORED_PIN_POSITIONS = [
     ("LED", 0, "x", {"1": (96.19, 100.0), "2": (103.81, 100.0)}),
