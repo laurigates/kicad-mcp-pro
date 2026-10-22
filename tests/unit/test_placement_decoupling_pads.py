@@ -44,7 +44,23 @@ def _evaluate(
     evaluator.intent = ProjectDesignIntent(decoupling_pairs=pairs)
     evaluator.warnings = []
     violations, checked = evaluator._evaluate_decoupling()
+    # Every downgraded decoupling result must also be tracked as a gate-level advisory.
+    assert evaluator.decoupling_advisories == [
+        w for w in evaluator.warnings if w in evaluator.decoupling_advisories
+    ]
     return violations, checked, evaluator.warnings
+
+
+def _advisories(
+    footprints: dict[str, dict[str, Any]],
+    pairs: list[DecouplingPairIntent],
+) -> list[str]:
+    evaluator = _PlacementEvaluator.__new__(_PlacementEvaluator)
+    evaluator.footprints = footprints
+    evaluator.intent = ProjectDesignIntent(decoupling_pairs=pairs)
+    evaluator.warnings = []
+    evaluator._evaluate_decoupling()
+    return evaluator.decoupling_advisories
 
 
 def _pair(ic: str = "U1", caps: tuple[str, ...] = ("C1",), limit: float = 6.0):
@@ -156,7 +172,8 @@ def test_heuristic_centroid_within_limit_is_silent() -> None:
     assert warnings == []
 
 
-def test_far_pin_on_satisfied_net_is_warned_not_failed() -> None:
+def test_far_pin_on_otherwise_decoupled_net_fails() -> None:
+    # One cap next to pin 1 must not mask pin 24 on the far side of the package.
     footprints = {
         "U1": _fp(
             0.0,
@@ -169,10 +186,94 @@ def test_far_pin_on_satisfied_net_is_warned_not_failed() -> None:
         "C1": _cap(2.0, 0.0),
     }
     violations, _, warnings = _evaluate(footprints, [_pair()])
+    assert len(violations) == 1
+    assert "pin 24 -> C1.1" in violations[0]
+    assert "+3V3" in violations[0]
+    assert "12.04 mm" in violations[0]
+    assert warnings == []
+
+
+def test_wrong_net_only_cap_far_away_fails_as_uncapped() -> None:
+    # Full pad/net data, but the only cap is on +5V: a measured violation, not a heuristic.
+    footprints = {
+        "U1": _fp(
+            0.0,
+            0.0,
+            pads=[_pad("1", "+3V3", 1.0, 0.0, "power_in"), _pad("2", "GND", -1.0, 0.0)],
+        ),
+        "C1": _cap(20.0, 0.0, net="+5V"),
+    }
+    violations, checked, warnings = _evaluate(footprints, [_pair()])
+    assert checked == 1
+    assert len(violations) == 1
+    assert "no capacitor pad on supply net +3V3" in violations[0]
+    assert "pins 1" in violations[0]
+    assert not any("unavailable" in w for w in warnings)
+
+
+def test_wrong_net_only_cap_nearby_still_fails_as_uncapped() -> None:
+    footprints = {
+        "U1": _fp(0.0, 0.0, pads=[_pad("1", "+3V3", 1.0, 0.0, "power_in")]),
+        "C1": _cap(3.0, 0.0, net="+5V"),
+    }
+    violations, _, warnings = _evaluate(footprints, [_pair()])
+    assert len(violations) == 1
+    assert "no capacitor pad on supply net +3V3" in violations[0]
+    assert warnings == []
+
+
+def test_uncapped_second_rail_fails_even_when_first_rail_is_decoupled() -> None:
+    footprints = {
+        "U1": _fp(
+            0.0,
+            0.0,
+            pads=[
+                _pad("1", "+3V3", 1.0, 0.0, "power_in"),
+                _pad("9", "+3V3A", -1.0, 0.0, "power_in"),
+            ],
+        ),
+        "C1": _cap(3.0, 0.0),
+    }
+    violations, _, _ = _evaluate(footprints, [_pair()])
+    assert len(violations) == 1
+    assert "no capacitor pad on supply net +3V3A" in violations[0]
+    assert "pins 9" in violations[0]
+
+
+def test_cap_pads_without_net_data_fall_back_to_heuristic() -> None:
+    # Unannotated board: capacitor pads carry no nets, so nothing is measurable.
+    footprints = {
+        "U1": _fp(0.0, 0.0, pads=[_pad("1", "+3V3", 1.0, 0.0, "power_in")]),
+        "C1": _fp(
+            40.0,
+            0.0,
+            name="Capacitor_SMD:C_0603",
+            pads=[_pad("1", "", 39.0, 0.0), _pad("2", "", 41.0, 0.0)],
+        ),
+    }
+    violations, _, warnings = _evaluate(footprints, [_pair()])
     assert violations == []
     assert len(warnings) == 1
-    assert "24" in warnings[0]
-    assert "+3V3" in warnings[0]
+    assert "heuristic centroid proxy 40.00 mm" in warnings[0]
+    assert _advisories(footprints, [_pair()]) == warnings
+
+
+def test_heuristic_and_esd_results_are_gate_advisories() -> None:
+    heuristic = {
+        "U1": _fp(10.0, 10.0, name="Package_QFP:TQFP-48"),
+        "C1": _fp(30.0, 20.0, name="Capacitor_SMD:C_0603"),
+    }
+    assert len(_advisories(heuristic, [_pair(limit=4.0)])) == 1
+    esd = {
+        "U4": _fp(0.0, 0.0, value="USBLC6-2SC6", pads=[_pad("5", "VBUS", 0.0, 0.0, "power_in")]),
+        "C1": _cap(30.0, 0.0, net="VBUS"),
+    }
+    assert len(_advisories(esd, [_pair(ic="U4")])) == 1
+    decoupled = {
+        "U1": _fp(0.0, 0.0, pads=[_pad("1", "+3V3", 1.0, 0.0, "power_in")]),
+        "C1": _cap(3.0, 0.0),
+    }
+    assert _advisories(decoupled, [_pair()]) == []
 
 
 def test_explicit_cap_missing_from_board_still_fails() -> None:

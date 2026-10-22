@@ -98,17 +98,22 @@ class PinDistance:
 class DecouplingMeasurement:
     """Pad-centre decoupling proximity for one IC.
 
-    ``verdict`` is ``"heuristic"`` when nothing could be measured from pad data
-    (no supply pins with nets, or no capacitor shares a supply net). Callers
-    should then fall back to a clearly labelled, non-failing heuristic.
+    ``verdict`` is ``"heuristic"`` only when pad data cannot support a
+    measurement: the IC has no supply pins with a net and a position, or no
+    capacitor pad on the board carries net data. Callers should then fall back
+    to a clearly labelled, non-failing heuristic.
+
+    ``"fail"`` is a measured violation: a supply pin whose nearest same-net
+    capacitor pad is beyond the limit (``failing_pins``), or a supply net with
+    no same-net capacitor pad anywhere on the board (``uncapped_nets``).
     """
 
     verdict: Literal["pass", "fail", "heuristic"]
     limit_mm: float
     per_pin: tuple[PinDistance, ...] = ()
-    failing_nets: tuple[PinDistance, ...] = ()
-    over_limit_pins: tuple[PinDistance, ...] = ()
-    unmeasured_nets: tuple[str, ...] = ()
+    failing_pins: tuple[PinDistance, ...] = ()
+    uncapped_nets: tuple[str, ...] = ()
+    uncapped_pins: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 def _coords(pad: PadView) -> tuple[float, float] | None:
@@ -145,6 +150,14 @@ def _nearest(
     return PinDistance(pin, net, cap_ref, cap_pad, round(distance, 4))
 
 
+def _has_cap_net_data(cap_pads_by_ref: Mapping[str, Sequence[PadView]]) -> bool:
+    return any(
+        _coords(pad) is not None and str(pad.get("net", "") or "").strip()
+        for pads in cap_pads_by_ref.values()
+        for pad in pads
+    )
+
+
 def measure_decoupling(
     ic_pads: Sequence[PadView],
     cap_pads_by_ref: Mapping[str, Sequence[PadView]],
@@ -152,11 +165,10 @@ def measure_decoupling(
 ) -> DecouplingMeasurement:
     """Measure each IC supply pin against the nearest same-net capacitor pad.
 
-    A supply net fails only when *no* IC pin on that net has a same-net
-    capacitor pad within ``limit_mm``. Individual pins over the limit on an
-    otherwise satisfied net are reported in ``over_limit_pins`` for a warning,
-    because one capacitor commonly serves adjacent pins of the same rail.
-    Supply nets without any capacitor are reported as ``unmeasured_nets``.
+    Every supply pin is judged on its own: a pin fails when its nearest
+    same-net capacitor pad is farther than ``limit_mm``, even if another pin on
+    the same net is decoupled. A supply net with no same-net capacitor pad at
+    all fails as ``uncapped_nets`` whenever capacitor net data is available.
     """
     pins_by_net: dict[str, list[tuple[str, tuple[float, float]]]] = {}
     for pad in ic_pads:
@@ -166,34 +178,28 @@ def measure_decoupling(
         net = str(pad.get("net", "")).strip()
         pins_by_net.setdefault(net, []).append((str(pad.get("number", "")), point))
 
+    if not pins_by_net or not _has_cap_net_data(cap_pads_by_ref):
+        return DecouplingMeasurement(verdict="heuristic", limit_mm=limit_mm)
+
     per_pin: list[PinDistance] = []
     failing: list[PinDistance] = []
-    over_limit: list[PinDistance] = []
-    unmeasured: list[str] = []
+    uncapped: list[str] = []
+    uncapped_pins: list[tuple[str, tuple[str, ...]]] = []
     for net in sorted(pins_by_net):
         candidates = _cap_pads_on_net(cap_pads_by_ref, net)
         if not candidates:
-            unmeasured.append(net)
+            uncapped.append(net)
+            uncapped_pins.append((net, tuple(pin for pin, _ in pins_by_net[net])))
             continue
         measured = [_nearest(pin, net, point, candidates) for pin, point in pins_by_net[net]]
         per_pin.extend(measured)
-        best = min(measured, key=lambda item: item.distance_mm)
-        if best.distance_mm > limit_mm:
-            failing.append(best)
-        else:
-            over_limit.extend(item for item in measured if item.distance_mm > limit_mm)
+        failing.extend(item for item in measured if item.distance_mm > limit_mm)
 
-    if not per_pin:
-        return DecouplingMeasurement(
-            verdict="heuristic",
-            limit_mm=limit_mm,
-            unmeasured_nets=tuple(unmeasured),
-        )
     return DecouplingMeasurement(
-        verdict="fail" if failing else "pass",
+        verdict="fail" if failing or uncapped else "pass",
         limit_mm=limit_mm,
         per_pin=tuple(per_pin),
-        failing_nets=tuple(failing),
-        over_limit_pins=tuple(over_limit),
-        unmeasured_nets=tuple(unmeasured),
+        failing_pins=tuple(failing),
+        uncapped_nets=tuple(uncapped),
+        uncapped_pins=tuple(uncapped_pins),
     )

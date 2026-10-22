@@ -53,6 +53,7 @@ from .metadata import headless_compatible
 from .schematic_transfer import _collect_schematic_components, _export_schematic_net_map
 
 if TYPE_CHECKING:
+    from ..utils.decoupling_proximity import DecouplingMeasurement, PinDistance
     from .design_intent_state import DecouplingPairIntent, ProjectDesignIntent
 
 
@@ -103,6 +104,9 @@ class PlacementAnalysis:
     # Mechanical constraint checks
     mount_hole_violations: list[str] = field(default_factory=list)
     connector_edge_spec_violations: list[str] = field(default_factory=list)
+    # Heuristic-only or skipped decoupling results (also listed in ``warnings``);
+    # non-empty makes the placement gate WARN instead of PASS (issue #1380).
+    decoupling_advisories: list[str] = field(default_factory=list)
     # Before/after delta for auto-placement workflows
     score_before: int | None = None
 
@@ -1801,6 +1805,7 @@ class _PlacementEvaluator:
         )
         self.density_pct = round((self.footprint_area_mm2 / self.board_area_mm2) * 100.0, 2)
         self.warnings: list[str] = []
+        self.decoupling_advisories: list[str] = []
 
     def _is_outside_frame(self, x: float, y: float, w: float, h: float) -> bool:
         half_w = w / 2.0
@@ -1972,6 +1977,36 @@ class _PlacementEvaluator:
             )
         return cap_distances, missing_caps
 
+    @staticmethod
+    def _measured_decoupling_violations(
+        ic_ref: str,
+        measurement: DecouplingMeasurement,
+    ) -> list[str]:
+        """Render measured pad-to-pad violations: one per failing net, plus uncapped nets."""
+        limit = measurement.limit_mm
+        violations: list[str] = []
+        failing_by_net: dict[str, list[PinDistance]] = {}
+        for item in measurement.failing_pins:
+            failing_by_net.setdefault(item.net, []).append(item)
+        for net, items in failing_by_net.items():
+            worst = max(items, key=lambda item: item.distance_mm)
+            far = ", ".join(
+                f"{item.pin}->{item.cap_ref}.{item.cap_pad} {item.distance_mm:.2f} mm"
+                for item in items[:12]
+            )
+            violations.append(
+                f"{ic_ref}: nearest decoupling cap pad on supply net {net} is "
+                f"{worst.distance_mm:.2f} mm away (pin {worst.pin} -> "
+                f"{worst.cap_ref}.{worst.cap_pad}, pad-centre; limit {limit:.2f} mm). "
+                f"Supply pins over the limit: {far}."
+            )
+        for net, pins in measurement.uncapped_pins:
+            violations.append(
+                f"{ic_ref}: no capacitor pad on supply net {net} anywhere on the board "
+                f"(supply pins {', '.join(pins[:12])}); measured from pad net data."
+            )
+        return violations
+
     def _evaluate_decoupling_pair(
         self,
         pair: DecouplingPairIntent,
@@ -1979,11 +2014,13 @@ class _PlacementEvaluator:
     ) -> list[str]:
         """Judge decoupling by measured pad-to-pad proximity (issue #1380).
 
-        FAIL only for a measured violation: a supply net with same-net capacitor
-        pads, none within the limit of any IC pin on that net (or an explicit
-        capacitor ref missing from the board). Without usable pad/net data the
-        old centroid proxy is reported as a labelled heuristic WARN, never FAIL.
-        A pass is pad-centre proximity only, not a copper-path or EMC clearance.
+        FAIL only for a measured violation: an IC supply pin whose nearest
+        same-net capacitor pad is beyond the limit, a supply net with no
+        same-net capacitor pad on the board, or an explicit capacitor ref missing
+        from the board. Only when pad/net data cannot support a measurement is
+        the old centroid proxy reported, as a labelled heuristic WARN (gate
+        status WARN), never FAIL. A pass is pad-centre proximity only, not a
+        copper-path or EMC clearance.
         """
         from ..utils.decoupling_proximity import measure_decoupling
 
@@ -2001,39 +2038,24 @@ class _PlacementEvaluator:
             limit,
         )
         if measurement.verdict == "fail":
-            per_pin = ", ".join(
-                f"{item.pin}({item.net})->{item.cap_ref}.{item.cap_pad} {item.distance_mm:.2f} mm"
-                for item in measurement.per_pin[:12]
-            )
-            for worst in measurement.failing_nets:
-                violations.append(
-                    f"{pair.ic_ref}: nearest decoupling cap pad on supply net {worst.net} is "
-                    f"{worst.distance_mm:.2f} mm away (pin {worst.pin} -> "
-                    f"{worst.cap_ref}.{worst.cap_pad}, pad-centre; limit {limit:.2f} mm). "
-                    f"Per-pin: {per_pin}."
-                )
-        elif measurement.verdict == "pass":
-            if measurement.over_limit_pins:
-                far = ", ".join(
-                    f"{item.pin}({item.net}) {item.distance_mm:.2f} mm"
-                    for item in measurement.over_limit_pins[:12]
-                )
-                self.warnings.append(
-                    f"{pair.ic_ref}: supply pins farther than {limit:.2f} mm from any same-net "
-                    "capacitor pad (net is decoupled at another pin; pad-centre proximity "
-                    f"only): {far}."
-                )
-        elif cap_distances and min(cap_distances) > limit:
-            self.warnings.append(
+            violations.extend(self._measured_decoupling_violations(pair.ic_ref, measurement))
+        elif measurement.verdict == "heuristic" and cap_distances and min(cap_distances) > limit:
+            self._add_decoupling_advisory(
                 f"{pair.ic_ref}: heuristic centroid proxy {min(cap_distances):.2f} mm exceeds "
-                f"{limit:.2f} mm; pad/net data unavailable for a measured pad-to-pad "
-                "decoupling check (not a FAIL)."
+                f"{limit:.2f} mm; IC supply-pin or capacitor pad net data unavailable for a "
+                "measured pad-to-pad decoupling check (not a FAIL)."
             )
         return violations
+
+    def _add_decoupling_advisory(self, message: str) -> None:
+        """Record a heuristic or skipped decoupling result: a WARN, never PASS or FAIL."""
+        self.warnings.append(message)
+        self.decoupling_advisories.append(message)
 
     def _evaluate_decoupling(self) -> tuple[list[str], int]:
         from ..utils.decoupling_proximity import is_esd_protection_device
 
+        self.decoupling_advisories = []
         decoupling_distance_violations: list[str] = []
         checked_decoupling_pairs = 0
         for pair in self.intent.decoupling_pairs:
@@ -2051,7 +2073,7 @@ class _PlacementEvaluator:
             value = str(ic_entry.get("value", ""))
             name = str(ic_entry.get("name", ""))
             if is_esd_protection_device(pair.ic_ref, value, name):
-                self.warnings.append(
+                self._add_decoupling_advisory(
                     f"{pair.ic_ref}: classified as ESD/TVS protection device "
                     f"({value or name}); generic decoupling-capacitor distance rule not applied."
                 )
@@ -2498,6 +2520,7 @@ class _PlacementEvaluator:
             return_path_warnings=return_path_warnings,
             mount_hole_violations=mount_hole_violations,
             connector_edge_spec_violations=connector_edge_spec_violations,
+            decoupling_advisories=list(self.decoupling_advisories),
         )
 
 
@@ -2566,6 +2589,16 @@ def _format_placement_score(analysis: PlacementAnalysis) -> str:
     return "\n".join(lines)
 
 
+_PLACEMENT_GATE_SUMMARIES: dict[str, str] = {
+    "PASS": "Footprint placement is geometrically and contextually sane.",
+    "WARN": (
+        "Footprint placement has no hard violations, but some decoupling checks are "
+        "heuristic-only or were not applied; review the WARN details."
+    ),
+    "FAIL": "Footprint placement still violates hard physical or intent-aware checks.",
+}
+
+
 def _evaluate_pcb_placement_gate() -> GateOutcome:
     analysis, blocked = _placement_analysis()
     if blocked is not None:
@@ -2573,7 +2606,13 @@ def _evaluate_pcb_placement_gate() -> GateOutcome:
     if analysis is None:
         raise RuntimeError(_MISSING_PLACEMENT_ANALYSIS)
 
-    status: GateStatus = "PASS" if not analysis.hard_failures else "FAIL"
+    status: GateStatus
+    if analysis.hard_failures:
+        status = "FAIL"
+    elif analysis.decoupling_advisories:
+        status = "WARN"
+    else:
+        status = "PASS"
     details = [
         f"Footprints analysed: {analysis.footprint_count}",
         f"Board frame: {analysis.board_width_mm:.2f} x {analysis.board_height_mm:.2f} mm",
@@ -2596,9 +2635,7 @@ def _evaluate_pcb_placement_gate() -> GateOutcome:
     return GateOutcome(
         name="Placement",
         status=status,
-        summary="Footprint placement is geometrically and contextually sane."
-        if status == "PASS"
-        else "Footprint placement still violates hard physical or intent-aware checks.",
+        summary=_PLACEMENT_GATE_SUMMARIES[status],
         details=details,
     )
 

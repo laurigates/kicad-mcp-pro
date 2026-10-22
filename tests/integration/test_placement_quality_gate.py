@@ -300,8 +300,10 @@ async def test_pcb_placement_quality_gate_does_not_fail_esd_protector(
 
     gate = await call_tool_text(server, "pcb_placement_quality_gate", {})
 
-    assert "Placement quality gate: PASS" in gate
+    # Skipped by the generic rule, but surfaced as a gate-level WARN, not a PASS.
+    assert "Placement quality gate: WARN" in gate
     assert "ESD/TVS protection" in gate
+    assert "FAIL:" not in gate
 
 
 @pytest.mark.anyio
@@ -325,8 +327,56 @@ async def test_pcb_placement_quality_gate_warns_heuristic_without_pad_nets(
 
     gate = await call_tool_text(server, "pcb_placement_quality_gate", {})
 
-    assert "Placement quality gate: PASS" in gate
+    # Heuristic-only result: WARN at gate level, never FAIL and never a silent PASS.
+    assert "Placement quality gate: WARN" in gate
     assert "heuristic centroid proxy" in gate
+    assert "FAIL:" not in gate
+
+
+@pytest.mark.anyio
+async def test_pcb_placement_quality_gate_fails_when_only_cap_is_on_another_rail(
+    sample_project: Path,
+    mock_kicad,
+) -> None:
+    """Full pad/net data with no same-net cap is a measured violation (issue #1380 review)."""
+    _ = mock_kicad
+    _write_board(
+        sample_project,
+        _two_pad_block(
+            "U1",
+            "STM32F072C8T6",
+            10.0,
+            15.0,
+            name="Package_QFP:LQFP-48_7x7mm_P0.5mm",
+            half_w=3.5,
+            half_h=3.5,
+            pads=(
+                ("1", 3.0, 0.0, "+3V3", "power_in"),
+                ("8", -3.0, 0.0, "GND", "power_in"),
+            ),
+        ),
+        _two_pad_block(
+            "C6",
+            "100n",
+            16.5,
+            15.0,
+            name="Capacitor_SMD:C_0603",
+            pads=(("1", -0.9, 0.0, "+5V", ""), ("2", 0.9, 0.0, "GND", "")),
+        ),
+    )
+    server = build_server("full")
+    await call_tool_text(server, "kicad_set_project", {"project_dir": str(sample_project)})
+    await call_tool_text(
+        server,
+        "project_set_design_intent",
+        {"decoupling_pairs": [{"ic_ref": "U1", "cap_refs": ["C6"], "max_distance_mm": 6.0}]},
+    )
+
+    gate = await call_tool_text(server, "pcb_placement_quality_gate", {})
+
+    assert "Placement quality gate: FAIL" in gate
+    assert "no capacitor pad on supply net +3V3" in gate
+    assert "unavailable" not in gate
 
 
 @pytest.mark.anyio

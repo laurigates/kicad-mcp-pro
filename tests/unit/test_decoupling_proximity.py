@@ -38,14 +38,20 @@ def test_pad_far_same_net_cap_fails_with_per_pin_distances() -> None:
 
     assert result.verdict == "fail"
     assert [p.pin for p in result.per_pin] == ["1", "7"]
-    assert result.failing_nets[0].net == "+3V3"
-    assert result.failing_nets[0].distance_mm == pytest.approx(20.0)
+    assert [p.pin for p in result.failing_pins] == ["1", "7"]
+    assert result.failing_pins[0].net == "+3V3"
+    assert result.failing_pins[0].distance_mm == pytest.approx(20.0)
 
 
 def test_cap_on_different_net_is_ignored() -> None:
     ic_pads = [_pad("1", "+3V3", 0.0, 0.0, "power_in")]
     near_wrong_net = {"C1": [_pad("1", "+5V", 0.5, 0.0), _pad("2", "GND", 1.5, 0.0)]}
-    assert measure_decoupling(ic_pads, near_wrong_net, limit_mm=6.0).verdict != "pass"
+    # Capacitor net data exists, so a supply net without any same-net cap is a
+    # measured violation, not a "pad data unavailable" heuristic.
+    only_wrong_net = measure_decoupling(ic_pads, near_wrong_net, limit_mm=6.0)
+    assert only_wrong_net.verdict == "fail"
+    assert only_wrong_net.uncapped_nets == ("+3V3",)
+    assert only_wrong_net.per_pin == ()
 
     with_far_right_net = {
         **near_wrong_net,
@@ -79,29 +85,49 @@ def test_supply_pin_detection_rules() -> None:
 
 def test_missing_pad_data_is_heuristic() -> None:
     assert measure_decoupling([], {"C1": []}, limit_mm=6.0).verdict == "heuristic"
-    # Supply pins exist but no capacitor shares any supply net: nothing measurable.
+    # Supply pins exist but no capacitor pad carries net data: nothing measurable.
     ic_pads = [_pad("1", "+3V3", 0.0, 0.0, "power_in")]
     assert measure_decoupling(ic_pads, {"C1": []}, limit_mm=6.0).verdict == "heuristic"
+    unnetted = {"C1": [_pad("1", "", 0.5, 0.0), _pad("2", "", 1.5, 0.0)]}
+    assert measure_decoupling(ic_pads, unnetted, limit_mm=6.0).verdict == "heuristic"
 
 
-def test_satisfied_net_reports_far_pins_without_failing() -> None:
+def test_far_pin_fails_even_when_another_pin_on_the_net_is_decoupled() -> None:
+    # A near cap at one VDD pin must not mask a VDD pin on the far side of the IC.
     ic_pads = [_pad("1", "+3V3", 0.0, 0.0, "power_in"), _pad("24", "+3V3", 0.0, 12.0, "power_in")]
     caps = {"C1": [_pad("1", "+3V3", 1.0, 0.0), _pad("2", "GND", 2.0, 0.0)]}
 
     result = measure_decoupling(ic_pads, caps, limit_mm=6.0)
 
-    assert result.verdict == "pass"
-    assert [p.pin for p in result.over_limit_pins] == ["24"]
+    assert result.verdict == "fail"
+    assert [p.pin for p in result.per_pin] == ["1", "24"]
+    assert [p.pin for p in result.failing_pins] == ["24"]
 
 
-def test_supply_net_without_any_cap_is_unmeasured_not_failed() -> None:
+def test_supply_net_without_any_cap_fails_as_uncapped() -> None:
     ic_pads = [_pad("1", "+3V3", 0.0, 0.0, "power_in"), _pad("2", "VBAT", 0.0, 1.0, "power_in")]
     caps = {"C1": [_pad("1", "+3V3", 1.0, 0.0), _pad("2", "GND", 2.0, 0.0)]}
 
     result = measure_decoupling(ic_pads, caps, limit_mm=6.0)
 
+    assert result.verdict == "fail"
+    assert result.failing_pins == ()
+    assert result.uncapped_nets == ("VBAT",)
+    assert result.uncapped_pins == (("VBAT", ("2",)),)
+
+
+def test_all_pins_within_limit_pass() -> None:
+    ic_pads = [_pad("1", "+3V3", 0.0, 0.0, "power_in"), _pad("24", "+3V3", 0.0, 12.0, "power_in")]
+    caps = {
+        "C1": [_pad("1", "+3V3", 1.0, 0.0), _pad("2", "GND", 2.0, 0.0)],
+        "C2": [_pad("1", "+3V3", 1.0, 12.0), _pad("2", "GND", 2.0, 12.0)],
+    }
+
+    result = measure_decoupling(ic_pads, caps, limit_mm=6.0)
+
     assert result.verdict == "pass"
-    assert result.unmeasured_nets == ("VBAT",)
+    assert result.failing_pins == ()
+    assert result.uncapped_nets == ()
 
 
 @pytest.mark.parametrize(
