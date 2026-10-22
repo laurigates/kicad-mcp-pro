@@ -171,6 +171,147 @@ async def test_pcb_placement_quality_gate_fails_decoupling_distance(
     _ = mock_kicad
     _write_board(
         sample_project,
+        _footprint_block("U1", "MCU", 10.0, 10.0, name="Package_QFP:TQFP-48", net_name="+3V3"),
+        _footprint_block("C1", "100n", 30.0, 20.0, name="Capacitor_SMD:C_0603", net_name="+3V3"),
+    )
+    server = build_server("full")
+    await call_tool_text(server, "kicad_set_project", {"project_dir": str(sample_project)})
+    await call_tool_text(
+        server,
+        "project_set_design_intent",
+        {"decoupling_pairs": [{"ic_ref": "U1", "cap_refs": ["C1"], "max_distance_mm": 4.0}]},
+    )
+
+    gate = await call_tool_text(server, "pcb_placement_quality_gate", {})
+
+    assert "Placement quality gate: FAIL" in gate
+    assert "nearest decoupling cap" in gate
+    assert "pin 1 -> C1.1" in gate
+
+
+def _two_pad_block(
+    reference: str,
+    value: str,
+    x_mm: float,
+    y_mm: float,
+    *,
+    name: str,
+    pads: tuple[tuple[str, float, float, str, str], ...],
+    half_w: float = 1.0,
+    half_h: float = 1.0,
+) -> str:
+    pad_lines = "".join(
+        f'\t\t(pad "{number}" smd rect (at {px:.3f} {py:.3f}) (size 0.6 0.6) '
+        f'(layers "F.Cu" "F.Mask" "F.Paste") (net 1 "{net}")'
+        + (f' (pintype "{pintype}")' if pintype else "")
+        + ")\n"
+        for number, px, py, net, pintype in pads
+    )
+    return (
+        f'\t(footprint "{name}"\n'
+        '\t\t(layer "F.Cu")\n'
+        f"\t\t(at {x_mm:.2f} {y_mm:.2f} 0)\n"
+        f'\t\t(property "Reference" "{reference}" (at 0 0 0) (layer "F.SilkS"))\n'
+        f'\t\t(property "Value" "{value}" (at 0 1 0) (layer "F.Fab"))\n'
+        f"\t\t(fp_rect (start {-half_w:.2f} {-half_h:.2f}) (end {half_w:.2f} {half_h:.2f}) "
+        '(stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))\n'
+        f"{pad_lines}"
+        "\t)\n"
+    )
+
+
+@pytest.mark.anyio
+async def test_pcb_placement_quality_gate_passes_centroid_far_pad_near_cap(
+    sample_project: Path,
+    mock_kicad,
+) -> None:
+    """Issue #1380: origin-offset cap at 6.5 mm centroid, same-net pad about 2.6 mm away."""
+    _ = mock_kicad
+    _write_board(
+        sample_project,
+        _two_pad_block(
+            "U1",
+            "STM32F072C8T6",
+            10.0,
+            15.0,
+            name="Package_QFP:LQFP-48_7x7mm_P0.5mm",
+            half_w=3.5,
+            half_h=3.5,
+            pads=(
+                ("1", 3.0, 0.0, "+3V3", "power_in"),
+                ("8", -3.0, 0.0, "GND", "power_in"),
+            ),
+        ),
+        _two_pad_block(
+            "C6",
+            "100n",
+            16.5,
+            15.0,
+            name="Capacitor_SMD:C_0603",
+            pads=(("1", -0.9, 0.0, "+3V3", ""), ("2", 0.9, 0.0, "GND", "")),
+        ),
+    )
+    server = build_server("full")
+    await call_tool_text(server, "kicad_set_project", {"project_dir": str(sample_project)})
+    await call_tool_text(
+        server,
+        "project_set_design_intent",
+        {"decoupling_pairs": [{"ic_ref": "U1", "cap_refs": ["C6"], "max_distance_mm": 6.0}]},
+    )
+
+    gate = await call_tool_text(server, "pcb_placement_quality_gate", {})
+
+    assert "Placement quality gate: PASS" in gate
+    assert "nearest decoupling cap" not in gate
+
+
+@pytest.mark.anyio
+async def test_pcb_placement_quality_gate_does_not_fail_esd_protector(
+    sample_project: Path,
+    mock_kicad,
+) -> None:
+    _ = mock_kicad
+    _write_board(
+        sample_project,
+        _two_pad_block(
+            "U4",
+            "USBLC6-2SC6",
+            5.0,
+            5.0,
+            name="Package_TO_SOT_SMD:SOT-23-6",
+            pads=(("5", 0.0, 0.0, "VBUS", "power_in"), ("2", 0.5, 0.0, "GND", "power_in")),
+        ),
+        _two_pad_block(
+            "C1",
+            "100n",
+            35.0,
+            25.0,
+            name="Capacitor_SMD:C_0603",
+            pads=(("1", -0.9, 0.0, "VBUS", ""), ("2", 0.9, 0.0, "GND", "")),
+        ),
+    )
+    server = build_server("full")
+    await call_tool_text(server, "kicad_set_project", {"project_dir": str(sample_project)})
+    await call_tool_text(
+        server,
+        "project_set_design_intent",
+        {"decoupling_pairs": [{"ic_ref": "U4", "cap_refs": ["C1"], "max_distance_mm": 6.0}]},
+    )
+
+    gate = await call_tool_text(server, "pcb_placement_quality_gate", {})
+
+    assert "Placement quality gate: PASS" in gate
+    assert "ESD/TVS protection" in gate
+
+
+@pytest.mark.anyio
+async def test_pcb_placement_quality_gate_warns_heuristic_without_pad_nets(
+    sample_project: Path,
+    mock_kicad,
+) -> None:
+    _ = mock_kicad
+    _write_board(
+        sample_project,
         _footprint_block("U1", "MCU", 10.0, 10.0, name="Package_QFP:TQFP-48"),
         _footprint_block("C1", "100n", 30.0, 20.0, name="Capacitor_SMD:C_0603"),
     )
@@ -184,8 +325,8 @@ async def test_pcb_placement_quality_gate_fails_decoupling_distance(
 
     gate = await call_tool_text(server, "pcb_placement_quality_gate", {})
 
-    assert "Placement quality gate: FAIL" in gate
-    assert "nearest decoupling cap is" in gate
+    assert "Placement quality gate: PASS" in gate
+    assert "heuristic centroid proxy" in gate
 
 
 @pytest.mark.anyio

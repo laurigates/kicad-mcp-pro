@@ -136,6 +136,54 @@ def _footprint_pad_net_map(block: str) -> dict[str, str]:
     return pad_map
 
 
+def _local_to_board_mm(
+    root_at: tuple[float, float, int],
+    x: float,
+    y: float,
+) -> tuple[float, float]:
+    """Map a footprint-local point to board coordinates (KiCad Y-down, CCW degrees)."""
+    px, py, degrees = root_at
+    theta = math.radians(degrees)
+    cos_t, sin_t = math.cos(theta), math.sin(theta)
+    return px + x * cos_t + y * sin_t, py - x * sin_t + y * cos_t
+
+
+def _footprint_pad_geometry(
+    block: str,
+    root_at: tuple[float, float, int] | None,
+) -> list[dict[str, Any]]:
+    """Return every pad with its board-coordinate centre, net and pin type.
+
+    KiCad stores a pad's ``(at x y [angle])`` position footprint-local while the
+    angle already includes the footprint rotation, so only the position is
+    transformed. Pads sharing a number (exposed-pad segments) are all kept.
+    """
+    if root_at is None:
+        return []
+    pads: list[dict[str, Any]] = []
+    for pad_block in _iter_blocks(block, "pad"):
+        number_match = re.match(rf"\(pad\s+{STRING_PATTERN}", pad_block.lstrip())
+        at_match = re.search(
+            rf"\(at\s+({FLOAT_PATTERN})\s+({FLOAT_PATTERN})(?:\s+{FLOAT_PATTERN})?\)",
+            pad_block,
+        )
+        if number_match is None or at_match is None:
+            continue
+        net_match = re.search(rf"\(net(?:\s+\d+)?\s+{STRING_PATTERN}\)", pad_block)
+        pintype_match = re.search(rf"\(pintype\s+{STRING_PATTERN}\)", pad_block)
+        x_mm, y_mm = _local_to_board_mm(root_at, float(at_match.group(1)), float(at_match.group(2)))
+        pads.append(
+            {
+                "number": number_match.group(1),
+                "net": net_match.group(1) if net_match else "",
+                "pintype": pintype_match.group(1) if pintype_match else "",
+                "x_mm": round(x_mm, 5),
+                "y_mm": round(y_mm, 5),
+            }
+        )
+    return pads
+
+
 def _courtyard_shape_points(
     primitive: str,
     item: str,
@@ -194,10 +242,7 @@ def _absolute_courtyard_bounds_mm(
     local_points = _local_courtyard_points(block)
     if local_points is None:
         return None
-    px, py, degrees = root_at
-    theta = math.radians(degrees)
-    cos_t, sin_t = math.cos(theta), math.sin(theta)
-    rotated = [(px + x * cos_t + y * sin_t, py - x * sin_t + y * cos_t) for x, y in local_points]
+    rotated = [_local_to_board_mm(root_at, x, y) for x, y in local_points]
     return (
         round(min(p[0] for p in rotated), 5),
         round(min(p[1] for p in rotated), 5),
@@ -253,6 +298,7 @@ def _build_footprint_entry(
         "layer_name_explicit": explicit_layer is not None,
         "net_names": _footprint_net_names(block),
         "pad_nets": _footprint_pad_net_map(block),
+        "pads": _footprint_pad_geometry(block, root_at),
     }
     return ref_match.group(1), entry
 

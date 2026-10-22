@@ -8,6 +8,8 @@
     (property "Reference" "U1" (at 0 0 0) (layer "F.SilkS"))
     (property "Value" "MCU" (at 0 3.8 0) (layer "F.Fab"))
     (fp_rect (start -3 -3) (end 3 3) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
+    (pad "1" smd rect (at -2.5 -2.5) (size 0.6 0.6) (layers "F.Cu" "F.Mask" "F.Paste") (net 1 "+3V3") (pintype "power_in"))
+    (pad "2" smd rect (at -2.5 2.5) (size 0.6 0.6) (layers "F.Cu" "F.Mask" "F.Paste") (net 2 "GND") (pintype "power_in"))
   )
   (footprint "Capacitor_SMD:C_0603"
     (layer "F.Cu")
@@ -15,5 +17,7 @@
     (property "Reference" "C1" (at 0 0 0) (layer "F.SilkS"))
     (property "Value" "100n" (at 0 1.5 0) (layer "F.Fab"))
     (fp_rect (start -1 -0.6) (end 1 0.6) (stroke (width 0.05) (type solid)) (fill no) (layer "F.CrtYd"))
+    (pad "1" smd rect (at -0.75 0) (size 0.5 0.6) (layers "F.Cu" "F.Mask" "F.Paste") (net 1 "+3V3"))
+    (pad "2" smd rect (at 0.75 0) (size 0.5 0.6) (layers "F.Cu" "F.Mask" "F.Paste") (net 2 "GND"))
   )
 )

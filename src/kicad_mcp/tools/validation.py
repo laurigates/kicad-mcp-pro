@@ -1926,12 +1926,37 @@ class _PlacementEvaluator:
                 )
         return connector_edge_violations, checked_connectors
 
-    def _evaluate_decoupling_pair(
+    @staticmethod
+    def _is_capacitor_footprint(reference: str, entry: dict[str, Any]) -> bool:
+        if re.match(r"^C\d", reference):
+            return True
+        return "capacitor" in str(entry.get("name", "")).lower()
+
+    def _decoupling_cap_pads(
+        self,
+        pair: DecouplingPairIntent,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Pads of the intent's caps plus every other capacitor footprint on the board.
+
+        Inferred pairs name only the centroid-nearest capacitor, which may sit on
+        another rail; any same-net capacitor physically decouples the pin, so all
+        capacitors are candidates and the net filter happens in the measurement.
+        """
+        cap_pads: dict[str, list[dict[str, Any]]] = {}
+        for reference, entry in self.footprints.items():
+            if reference == pair.ic_ref:
+                continue
+            if reference in pair.cap_refs or self._is_capacitor_footprint(reference, entry):
+                pads = entry.get("pads")
+                if pads:
+                    cap_pads[reference] = list(pads)
+        return cap_pads
+
+    def _centroid_decoupling_distances(
         self,
         pair: DecouplingPairIntent,
         ic_entry: dict[str, Any],
-    ) -> list[str]:
-        violations: list[str] = []
+    ) -> tuple[list[float], list[str]]:
         cap_distances: list[float] = []
         missing_caps: list[str] = []
         for cap_ref in pair.cap_refs:
@@ -1945,19 +1970,70 @@ class _PlacementEvaluator:
                     float(ic_entry["y_mm"]) - float(cap_entry["y_mm"]),
                 )
             )
+        return cap_distances, missing_caps
+
+    def _evaluate_decoupling_pair(
+        self,
+        pair: DecouplingPairIntent,
+        ic_entry: dict[str, Any],
+    ) -> list[str]:
+        """Judge decoupling by measured pad-to-pad proximity (issue #1380).
+
+        FAIL only for a measured violation: a supply net with same-net capacitor
+        pads, none within the limit of any IC pin on that net (or an explicit
+        capacitor ref missing from the board). Without usable pad/net data the
+        old centroid proxy is reported as a labelled heuristic WARN, never FAIL.
+        A pass is pad-centre proximity only, not a copper-path or EMC clearance.
+        """
+        from ..utils.decoupling_proximity import measure_decoupling
+
+        violations: list[str] = []
+        cap_distances, missing_caps = self._centroid_decoupling_distances(pair, ic_entry)
         if missing_caps:
             violations.append(
                 f"{pair.ic_ref}: missing or unresolved decoupling caps -> "
                 + ", ".join(missing_caps[:12])
             )
-        if cap_distances and min(cap_distances) > pair.max_distance_mm:
-            violations.append(
-                f"{pair.ic_ref}: nearest decoupling cap is {min(cap_distances):.2f} mm away "
-                f"(limit {pair.max_distance_mm:.2f} mm)."
+        limit = pair.max_distance_mm
+        measurement = measure_decoupling(
+            list(ic_entry.get("pads") or []),
+            self._decoupling_cap_pads(pair),
+            limit,
+        )
+        if measurement.verdict == "fail":
+            per_pin = ", ".join(
+                f"{item.pin}({item.net})->{item.cap_ref}.{item.cap_pad} {item.distance_mm:.2f} mm"
+                for item in measurement.per_pin[:12]
+            )
+            for worst in measurement.failing_nets:
+                violations.append(
+                    f"{pair.ic_ref}: nearest decoupling cap pad on supply net {worst.net} is "
+                    f"{worst.distance_mm:.2f} mm away (pin {worst.pin} -> "
+                    f"{worst.cap_ref}.{worst.cap_pad}, pad-centre; limit {limit:.2f} mm). "
+                    f"Per-pin: {per_pin}."
+                )
+        elif measurement.verdict == "pass":
+            if measurement.over_limit_pins:
+                far = ", ".join(
+                    f"{item.pin}({item.net}) {item.distance_mm:.2f} mm"
+                    for item in measurement.over_limit_pins[:12]
+                )
+                self.warnings.append(
+                    f"{pair.ic_ref}: supply pins farther than {limit:.2f} mm from any same-net "
+                    "capacitor pad (net is decoupled at another pin; pad-centre proximity "
+                    f"only): {far}."
+                )
+        elif cap_distances and min(cap_distances) > limit:
+            self.warnings.append(
+                f"{pair.ic_ref}: heuristic centroid proxy {min(cap_distances):.2f} mm exceeds "
+                f"{limit:.2f} mm; pad/net data unavailable for a measured pad-to-pad "
+                "decoupling check (not a FAIL)."
             )
         return violations
 
     def _evaluate_decoupling(self) -> tuple[list[str], int]:
+        from ..utils.decoupling_proximity import is_esd_protection_device
+
         decoupling_distance_violations: list[str] = []
         checked_decoupling_pairs = 0
         for pair in self.intent.decoupling_pairs:
@@ -1970,6 +2046,14 @@ class _PlacementEvaluator:
             if ic_entry["x_mm"] is None or ic_entry["y_mm"] is None:
                 decoupling_distance_violations.append(
                     f"Decoupling IC ref '{pair.ic_ref}' has no resolved placement."
+                )
+                continue
+            value = str(ic_entry.get("value", ""))
+            name = str(ic_entry.get("name", ""))
+            if is_esd_protection_device(pair.ic_ref, value, name):
+                self.warnings.append(
+                    f"{pair.ic_ref}: classified as ESD/TVS protection device "
+                    f"({value or name}); generic decoupling-capacitor distance rule not applied."
                 )
                 continue
             checked_decoupling_pairs += 1
