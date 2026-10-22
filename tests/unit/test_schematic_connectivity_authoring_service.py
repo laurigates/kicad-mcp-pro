@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,7 @@ def _harness(
     route_warning: str | None = None,
     power_net: Callable[[str], bool] | None = None,
     power_lib: str | None = '(symbol "power:3V3")',
+    connectivity_groups: Callable[[str], list[dict[str, Any]]] | None = None,
 ) -> ServiceHarness:
     target = FakeTarget(tmp_path / "board.kicad_sch")
     target.path.write_text("(kicad_sch\n\t(sheet_instances)\n)", encoding="utf-8")
@@ -156,6 +157,10 @@ def _harness(
         library, symbol_name = lib_id.split(":", 1)
         return library, symbol_name
 
+    optional: dict[str, Any] = {}
+    if connectivity_groups is not None:
+        optional["route_connectivity_groups"] = connectivity_groups
+
     service = SchematicConnectivityAuthoringService(
         resolve_target=lambda sheet, sheet_file: target,
         parse_schematic=lambda path: parsed_value,
@@ -185,6 +190,7 @@ def _harness(
         route_avoiding_obstacles=route,
         run_auto_add_missing_junctions=lambda: "Inserted 2 missing junction(s).",
         snap_tolerance_mm=0.001,
+        **optional,
     )
     return ServiceHarness(service=service, writes=writes, calls=calls)
 
@@ -763,3 +769,261 @@ def test_resolve_pin_point_and_candidate_branches(tmp_path: Path) -> None:
     )
     assert pt is None
     assert err == "R1.99: pin not found"
+
+
+# ---------------------------------------------------------------------------
+# Post-route connectivity guard (issue #1388)
+# ---------------------------------------------------------------------------
+
+_ROUTE_START = (1.0, 1.0)
+_ROUTE_END = (5.0, 5.0)
+_ROUTE_SEGMENTS = [(1.0, 1.0, 5.0, 1.0), (5.0, 1.0, 5.0, 5.0)]
+
+
+def _group(
+    pins: list[tuple[str, str]],
+    points: list[tuple[float, float]],
+    names: list[str] | None = None,
+    *,
+    no_connect: bool = False,
+) -> dict[str, Any]:
+    return {
+        "names": sorted(names or []),
+        "points": sorted(points),
+        "pins": [{"reference": ref, "pin": pin} for ref, pin in pins],
+        "no_connect": no_connect,
+    }
+
+
+def _pre_post(
+    pre: list[dict[str, Any]], post: list[dict[str, Any]], seen: list[str] | None = None
+) -> Callable[[str], list[dict[str, Any]]]:
+    """Return a fake graph builder: ``post`` once the route's wires are in the text."""
+
+    def groups(text: str) -> list[dict[str, Any]]:
+        if seen is not None:
+            seen.append(text)
+        return post if "WIRE(" in text else pre
+
+    return groups
+
+
+def _guarded_harness(
+    tmp_path: Path,
+    groups: Callable[[str], list[dict[str, Any]]],
+    *,
+    route_warning: str | None = None,
+    power_symbols: list[dict[str, Any]] | None = None,
+) -> ServiceHarness:
+    symbols = [_symbol("R1")]
+    if power_symbols is None:
+        symbols.insert(0, _symbol("U1"))
+    return _harness(
+        tmp_path,
+        parsed={"symbols": symbols, "power_symbols": power_symbols or []},
+        pin_positions={
+            ("Device", "R"): {"1": _ROUTE_START, "2": _ROUTE_END},
+            ("power", "GND"): {"1": _ROUTE_START},
+        },
+        route_segments=list(_ROUTE_SEGMENTS),
+        route_warning=route_warning,
+        connectivity_groups=groups,
+    )
+
+
+def _assert_refused_without_write(
+    harness: ServiceHarness, tmp_path: Path, ref1: str = "U1", pin1: str = "1"
+) -> str:
+    original = (tmp_path / "board.kicad_sch").read_bytes()
+    with pytest.raises(SchematicRoutingUnsafeError) as error:
+        harness.service.route_wire_between_pins(ref1, pin1, "R1", "2")
+    message = str(error.value)
+    assert message.startswith(f"Route refused between {ref1}:{pin1} and R1:2: ")
+    assert message.endswith("No schematic changes were made.")
+    assert error.value.to_payload()["code"] == "SCHEMATIC_ROUTING_UNSAFE"
+    assert harness.writes == []
+    assert (tmp_path / "board.kicad_sch").read_bytes() == original
+    return message
+
+
+def test_route_refuses_when_post_route_merges_a_third_net(tmp_path: Path) -> None:
+    start = _group([("U1", "1")], [_ROUTE_START])
+    end = _group([("R1", "2")], [_ROUTE_END])
+    third = _group([("J1", "A7"), ("U2", "3")], [(9.0, 9.0)], ["USB_DM"])
+    merged = _group(
+        [("U1", "1"), ("R1", "2"), ("J1", "A7"), ("U2", "3")],
+        [_ROUTE_START, _ROUTE_END, (5.0, 1.0), (9.0, 9.0)],
+        ["USB_DM"],
+    )
+    harness = _guarded_harness(tmp_path, _pre_post([start, end, third], [merged]))
+
+    message = _assert_refused_without_write(harness, tmp_path)
+
+    assert "would merge another net" in message
+    assert "USB_DM" in message
+    assert "J1:A7" in message
+    assert "U2:3" in message
+
+
+def test_route_refuses_to_merge_two_distinct_named_nets(tmp_path: Path) -> None:
+    start = _group([("U1", "1"), ("J1", "A6")], [_ROUTE_START, (0.0, 1.0)], ["USB_DP"])
+    end = _group([("R1", "2"), ("U2", "3")], [_ROUTE_END, (6.0, 5.0)], ["USB_DM"])
+    merged = _group(
+        [("U1", "1"), ("J1", "A6"), ("R1", "2"), ("U2", "3")],
+        [_ROUTE_START, (0.0, 1.0), _ROUTE_END, (6.0, 5.0), (5.0, 1.0)],
+        ["USB_DM", "USB_DP"],
+    )
+    harness = _guarded_harness(tmp_path, _pre_post([start, end], [merged]))
+
+    message = _assert_refused_without_write(harness, tmp_path)
+
+    assert "distinct named nets" in message
+    assert "USB_DP" in message
+    assert "USB_DM" in message
+
+
+def test_route_refuses_to_merge_two_power_nets(tmp_path: Path) -> None:
+    gnd = _group([], [_ROUTE_START], ["GND"])
+    vcc = _group([("R1", "2")], [_ROUTE_END], ["VCC"])
+    merged = _group([("R1", "2")], [_ROUTE_START, _ROUTE_END, (5.0, 1.0)], ["GND", "VCC"])
+    power_symbol = {
+        "reference": "#PWR01",
+        "lib_id": "power:GND",
+        "value": "GND",
+        "x": 1.0,
+        "y": 1.0,
+        "rotation": 0,
+        "unit": 1,
+    }
+    harness = _guarded_harness(
+        tmp_path, _pre_post([gnd, vcc], [merged]), power_symbols=[power_symbol]
+    )
+
+    message = _assert_refused_without_write(harness, tmp_path, ref1="#PWR01")
+
+    assert "'GND'" in message
+    assert "'VCC'" in message
+
+
+def test_route_refuses_when_route_does_not_join_requested_endpoints(tmp_path: Path) -> None:
+    # e.g. a mirrored symbol whose real pin is not where the route ended.
+    start = _group([("U1", "1")], [_ROUTE_START])
+    end = _group([("R1", "2")], [(7.0, 5.0)])
+    post = [_group([("U1", "1")], [_ROUTE_START, (5.0, 1.0), _ROUTE_END]), end]
+    harness = _guarded_harness(tmp_path, _pre_post([start, end], post))
+
+    message = _assert_refused_without_write(harness, tmp_path)
+
+    assert "does not connect U1:1 to R1:2" in message
+
+
+def test_route_allows_extending_partially_drawn_named_net(tmp_path: Path) -> None:
+    start = _group([("U1", "1"), ("J1", "A6")], [_ROUTE_START, (0.0, 1.0)], ["USB_DP"])
+    end = _group([("R1", "2")], [_ROUTE_END])
+    merged = _group(
+        [("U1", "1"), ("J1", "A6"), ("R1", "2")],
+        [_ROUTE_START, (0.0, 1.0), _ROUTE_END, (5.0, 1.0)],
+        ["USB_DP"],
+    )
+    harness = _guarded_harness(tmp_path, _pre_post([start, end], [merged]))
+
+    result = harness.service.route_wire_between_pins("U1", "1", "R1", "2")
+
+    assert "Routed 2 wire segment(s)" in result
+    assert len(harness.writes) == 1
+
+
+def test_route_allows_endpoints_already_on_same_net(tmp_path: Path) -> None:
+    same = _group([("U1", "1"), ("R1", "2")], [_ROUTE_START, _ROUTE_END], ["USB_DP"])
+    post = _group([("U1", "1"), ("R1", "2")], [_ROUTE_START, _ROUTE_END, (5.0, 1.0)], ["USB_DP"])
+    harness = _guarded_harness(tmp_path, _pre_post([same], [post]))
+
+    harness.service.route_wire_between_pins("U1", "1", "R1", "2")
+
+    assert len(harness.writes) == 1
+
+
+def test_route_allows_absorbing_dangling_unnamed_wire(tmp_path: Path) -> None:
+    start = _group([("U1", "1")], [_ROUTE_START])
+    end = _group([("R1", "2")], [_ROUTE_END])
+    dangling = _group([], [(5.0, 2.0), (5.0, 3.0)])
+    merged = _group(
+        [("U1", "1"), ("R1", "2")],
+        [_ROUTE_START, _ROUTE_END, (5.0, 1.0), (5.0, 2.0), (5.0, 3.0)],
+    )
+    harness = _guarded_harness(tmp_path, _pre_post([start, end, dangling], [merged]))
+
+    harness.service.route_wire_between_pins("U1", "1", "R1", "2")
+
+    assert len(harness.writes) == 1
+
+
+def test_route_refuses_absorbing_no_connect_marker(tmp_path: Path) -> None:
+    start = _group([("U1", "1")], [_ROUTE_START])
+    end = _group([("R1", "2")], [_ROUTE_END])
+    marker = _group([], [(5.0, 2.0)], no_connect=True)
+    merged = _group(
+        [("U1", "1"), ("R1", "2")],
+        [_ROUTE_START, _ROUTE_END, (5.0, 1.0), (5.0, 2.0)],
+        no_connect=True,
+    )
+    harness = _guarded_harness(tmp_path, _pre_post([start, end, marker], [merged]))
+
+    message = _assert_refused_without_write(harness, tmp_path)
+
+    assert "no-connect" in message
+
+
+def test_route_guard_still_allows_reviewed_crossing_warning(tmp_path: Path) -> None:
+    start = _group([("U1", "1")], [_ROUTE_START])
+    end = _group([("R1", "2")], [_ROUTE_END])
+    crossed = _group([("J1", "A7")], [(3.0, 0.0), (3.0, 2.0)], ["USB_DM"])
+    merged = _group([("U1", "1"), ("R1", "2")], [_ROUTE_START, _ROUTE_END, (5.0, 1.0)])
+    harness = _guarded_harness(
+        tmp_path,
+        _pre_post([start, end, crossed], [merged, crossed]),
+        route_warning="WARNING: net_crossing_unavoidable",
+    )
+
+    result = harness.service.route_wire_between_pins("U1", "1", "R1", "2")
+
+    assert "WARNING: net_crossing_unavoidable" in result
+    assert len(harness.writes) == 1
+
+
+def test_route_guard_fails_closed_when_connectivity_cannot_be_built(tmp_path: Path) -> None:
+    def broken(_text: str) -> list[dict[str, Any]]:
+        raise ValueError("unparseable")
+
+    harness = _guarded_harness(tmp_path, broken)
+
+    message = _assert_refused_without_write(harness, tmp_path)
+
+    assert "connectivity check failed" in message
+
+
+def test_route_guard_judges_the_text_seen_inside_the_write(tmp_path: Path) -> None:
+    start = _group([("U1", "1")], [_ROUTE_START])
+    end = _group([("R1", "2")], [_ROUTE_END])
+    merged = _group([("U1", "1"), ("R1", "2")], [_ROUTE_START, _ROUTE_END, (5.0, 1.0)])
+    seen: list[str] = []
+    harness = _guarded_harness(tmp_path, _pre_post([start, end], [merged], seen))
+    in_write: list[bool] = []
+    inner = harness.service.transactional_write
+
+    def tracking_write(mutator: Callable[[str], str], path: Path | None) -> str:
+        in_write.append(True)
+        # Simulate a concurrent edit that lands before the write lock is taken.
+        (tmp_path / "board.kicad_sch").write_text(
+            "(kicad_sch\n\t(junction concurrent)\n\t(sheet_instances)\n)", encoding="utf-8"
+        )
+        return inner(mutator, path)
+
+    guarded = replace(harness.service, transactional_write=tracking_write)
+    guarded.route_wire_between_pins("U1", "1", "R1", "2")
+
+    assert in_write == [True]
+    assert len(seen) == 2
+    assert all("junction concurrent" in text for text in seen)
+    assert "WIRE(" not in seen[0]
+    assert seen[1] == harness.writes[0][1]

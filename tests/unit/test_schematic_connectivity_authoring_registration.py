@@ -102,7 +102,13 @@ def test_registration_preserves_names_descriptions_and_schemas() -> None:
         '``"output"``, ``"bidirectional"``) passed through to the label.\n'
     )
     assert tools["sch_route_wire_between_pins"].description == (
-        "Route deterministic Manhattan wire segments between two placed symbol pins."
+        "Route deterministic Manhattan wire segments between two placed symbol pins.\n"
+        "\n"
+        "Fails closed: the tool returns an error (``SCHEMATIC_ROUTING_UNSAFE``) and\n"
+        "writes nothing when the route would join any net other than the two pins'\n"
+        "own nets (overlap, T-junction, shared wire end, or a foreign pin, label or\n"
+        "power symbol on the path), would merge two differently named nets, or\n"
+        "would not actually connect the requested pins.\n"
     )
     assert tools["sch_add_missing_junctions"].description == (
         "Insert missing schematic junctions at T-intersection wire endpoints."

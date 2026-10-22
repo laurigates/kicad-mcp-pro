@@ -65,6 +65,105 @@ LABEL_KIND_TO_BLOCK_KIND: dict[str, str] = {
 }
 
 
+ConnectivityGroup = dict[str, Any]
+ConnectivityGroupsBuilder = Callable[[str], list[ConnectivityGroup]]
+#: A route endpoint as ``(reference, pin, point)``.
+RouteEndpoint = tuple[str, str, tuple[float, float]]
+
+
+def _point_key(x: float, y: float) -> tuple[float, float]:
+    return (round(float(x), 4), round(float(y), 4))
+
+
+def _group_point_keys(group: ConnectivityGroup) -> set[tuple[float, float]]:
+    return {_point_key(*point) for point in group.get("points", [])}
+
+
+def _group_pin_keys(group: ConnectivityGroup) -> set[tuple[str, str]]:
+    return {(str(pin["reference"]), str(pin["pin"])) for pin in group.get("pins", [])}
+
+
+def _find_endpoint_group(groups: list[ConnectivityGroup], endpoint: RouteEndpoint) -> int | None:
+    """Index of the group holding ``reference:pin``, else the one at ``point``.
+
+    Symbol pins are matched by identity, so a route that lands beside the real
+    (for example mirrored) pin is not mistaken for connecting it.  Power symbols
+    carry no pin entries, so they fall back to their anchor point.
+    """
+    reference, pin, point = endpoint
+    for index, group in enumerate(groups):
+        if (reference, pin) in _group_pin_keys(group):
+            return index
+    key = _point_key(*point)
+    for index, group in enumerate(groups):
+        if key in _group_point_keys(group):
+            return index
+    return None
+
+
+def _describe_group(group: ConnectivityGroup) -> str:
+    parts: list[str] = []
+    names = [f"'{name}'" for name in group.get("names", [])]
+    if names:
+        parts.append(", ".join(names))
+    pins = sorted(f"{ref}:{pin}" for ref, pin in _group_pin_keys(group))
+    if pins:
+        parts.append("(" + ", ".join(pins) + ")")
+    if group.get("no_connect"):
+        parts.append("(no-connect marker)")
+    return " ".join(parts)
+
+
+def route_merge_violation(
+    pre: list[ConnectivityGroup],
+    post: list[ConnectivityGroup],
+    start: RouteEndpoint,
+    end: RouteEndpoint,
+) -> str | None:
+    """Return why a route must be refused, or ``None`` when it is safe.
+
+    ``pre``/``post`` are the connectivity groups before and after the route's
+    wires are added.  A route may only join its two endpoints' own nets.  It is
+    refused when the result does not connect the requested pins, when it absorbs
+    any other net -- pins, labels, power symbols or no-connect markers reached by
+    collinear overlap, a T-junction, a shared wire endpoint or a connection point
+    on the path -- or when the two endpoint nets already carry different names.
+    A dangling unnamed wire without pins is not a net and may be absorbed.
+    """
+    post_start = _find_endpoint_group(post, start)
+    post_end = _find_endpoint_group(post, end)
+    if post_start is None or post_start != post_end:
+        return (
+            f"the route does not connect {start[0]}:{start[1]} to {end[0]}:{end[1]} "
+            "in the resulting connectivity"
+        )
+    merged_points = _group_point_keys(post[post_start])
+
+    pre_start = _find_endpoint_group(pre, start)
+    pre_end = _find_endpoint_group(pre, end)
+    own = {index for index in (pre_start, pre_end) if index is not None}
+
+    absorbed = [
+        _describe_group(group)
+        for index, group in enumerate(pre)
+        if index not in own
+        and (group.get("pins") or group.get("names") or group.get("no_connect"))
+        and _group_point_keys(group) & merged_points
+    ]
+    if absorbed:
+        return "the route would merge another net " + "; ".join(absorbed)
+
+    if pre_start is not None and pre_end is not None and pre_start != pre_end:
+        start_names = [f"'{name}'" for name in pre[pre_start].get("names", [])]
+        end_names = [f"'{name}'" for name in pre[pre_end].get("names", [])]
+        if start_names and end_names:
+            return (
+                f"the route would merge distinct named nets {', '.join(start_names)} and "
+                f"{', '.join(end_names)}; rename a label or connect them through a label instead"
+            )
+    return None
+
+
 def _no_module_boundaries(_content: str) -> list[BoundingBoxLike]:
     """No drawn boundaries to clear -- the default for callers predating the rule."""
     return []
@@ -131,6 +230,13 @@ class SchematicConnectivityAuthoringService:
     #: has to cross one to reach a pin inside it.  Defaults to none so a caller
     #: that predates the rule keeps working; only wire routing consults it.
     get_module_boundaries: Callable[[str], list[BoundingBoxLike]] = _no_module_boundaries
+    #: Builds the electrical connectivity groups of a schematic text (the shape of
+    #: ``_build_connectivity_groups``).  When wired, every route is checked against
+    #: the before/after connectivity of the exact text being written and refused if
+    #: it would join any net other than its two endpoints' nets (issue #1388).
+    #: ``None`` skips the check for callers that predate it; the composition root
+    #: always wires it.
+    route_connectivity_groups: ConnectivityGroupsBuilder | None = None
 
     def _init_placed_maps(
         self, data: dict[str, Any]
@@ -610,6 +716,10 @@ class SchematicConnectivityAuthoringService:
                 "No schematic changes were made."
             )
 
+        refusal_prefix = (
+            f"Route refused between {payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2}"
+        )
+
         def mutator(current: str) -> str:
             updated = current
             for segment in segments:
@@ -617,6 +727,16 @@ class SchematicConnectivityAuthoringService:
                     updated,
                     self.wire_block(*segment),
                 )
+            # Judge the exact text being written, under the write lock, so an edit
+            # landing between the read above and this write is checked too.
+            # Raising here aborts the write and leaves the file untouched.
+            self._guard_route_connectivity(
+                current,
+                updated,
+                (payload.ref1, payload.pin1, start),
+                (payload.ref2, payload.pin2, end),
+                refusal_prefix,
+            )
             return updated
 
         self.transactional_write(mutator, None)
@@ -634,6 +754,32 @@ class SchematicConnectivityAuthoringService:
             + (f"\n{routing_warning}" if routing_warning else "")
             + (f"\n{crossing_note}" if crossing_note else "")
         )
+
+    def _guard_route_connectivity(
+        self,
+        current: str,
+        updated: str,
+        start: RouteEndpoint,
+        end: RouteEndpoint,
+        refusal_prefix: str,
+    ) -> None:
+        """Refuse a route whose wires would join any net beyond its two endpoints."""
+        builder = self.route_connectivity_groups
+        if builder is None:
+            return
+        try:
+            pre = builder(current)
+            post = builder(updated)
+        except Exception as exc:  # noqa: BLE001 - an unverifiable route must fail closed
+            raise SchematicRoutingUnsafeError(
+                f"{refusal_prefix}: connectivity check failed ({exc}). "
+                "No schematic changes were made."
+            ) from exc
+        reason = route_merge_violation(pre, post, start, end)
+        if reason is not None:
+            raise SchematicRoutingUnsafeError(
+                f"{refusal_prefix}: {reason}. No schematic changes were made."
+            )
 
     def add_missing_junctions(self) -> str:
         """Repair T-intersection junctions and reload the active schematic."""

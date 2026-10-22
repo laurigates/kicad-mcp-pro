@@ -86,6 +86,7 @@ from .diagnostics import (
 )
 from .discovery import ensure_studio_project_watcher, find_kicad_version
 from .errors import (
+    KiCadMcpError,
     KiCadNotRunningError,
     ToolRegistrationTimeoutError,
 )
@@ -585,8 +586,34 @@ def _structured_tool_error_from_message(
     )
 
 
+def _typed_domain_error(exc: BaseException) -> KiCadMcpError | None:
+    """Return the stable domain error behind ``exc`` (following ``__cause__``)."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, KiCadMcpError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__
+    return None
+
+
 def _structured_tool_error(exc: BaseException, *, tool_name: str = "") -> mcp_types.CallToolResult:
-    return _structured_tool_error_from_message(_clean_tool_error(exc), tool_name=tool_name)
+    message = _clean_tool_error(exc)
+    typed = _typed_domain_error(exc)
+    if typed is not None and typed.code != KiCadMcpError.code:
+        # A typed domain error already names its stable code and hint; keep them
+        # instead of re-deriving a generic code from the message text.
+        return mcp_types.CallToolResult(
+            isError=True,
+            content=[
+                mcp_types.TextContent(
+                    type="text",
+                    text=f"{typed.code}: {message}\nHint: {typed.hint}",
+                )
+            ],
+        )
+    return _structured_tool_error_from_message(message, tool_name=tool_name)
 
 
 def _result_text(result: object) -> str:

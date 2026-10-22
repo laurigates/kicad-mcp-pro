@@ -29,9 +29,7 @@ from __future__ import annotations
 
 import json
 import re
-import tempfile
 from collections.abc import Callable, Iterator
-from pathlib import Path
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer as FastMCP
@@ -40,7 +38,7 @@ from ..models import visual_qa
 from ..utils.sexpr import _extract_block
 from .metadata import headless_compatible
 from .schematic import (
-    _build_connectivity_groups,
+    _connectivity_groups_for_text,
     _fmt_mm,
     _get_schematic_file,
     _label_justify_from_block,
@@ -86,15 +84,7 @@ def _connectivity_signature(text: str) -> ConnectivitySignature:
     changes it. That is exactly the safety predicate the fixers need.
     """
 
-    with tempfile.NamedTemporaryFile(
-        "w", suffix=".kicad_sch", delete=False, encoding="utf-8"
-    ) as handle:
-        handle.write(text)
-        tmp_path = Path(handle.name)
-    try:
-        groups = _build_connectivity_groups(tmp_path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    groups = _connectivity_groups_for_text(text)
 
     return frozenset(
         (

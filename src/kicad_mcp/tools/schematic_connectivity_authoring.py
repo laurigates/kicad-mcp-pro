@@ -68,7 +68,14 @@ def register(mcp: FastMCP, dependencies: SchematicConnectivityAuthoringDependenc
         pin2: str,
         snap_to_grid: bool = True,
     ) -> str:
-        """Route deterministic Manhattan wire segments between two placed symbol pins."""
+        """Route deterministic Manhattan wire segments between two placed symbol pins.
+
+        Fails closed: the tool returns an error (``SCHEMATIC_ROUTING_UNSAFE``) and
+        writes nothing when the route would join any net other than the two pins'
+        own nets (overlap, T-junction, shared wire end, or a foreign pin, label or
+        power symbol on the path), would merge two differently named nets, or
+        would not actually connect the requested pins.
+        """
         return service.route_wire_between_pins(
             ref1=ref1,
             pin1=pin1,

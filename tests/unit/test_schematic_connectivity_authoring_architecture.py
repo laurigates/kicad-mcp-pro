@@ -44,3 +44,10 @@ def test_schematic_composition_root_delegates_connectivity_authoring() -> None:
     ):
         assert nested_tool not in source
     assert "def run_auto_add_missing_junctions(" in source
+
+
+def test_composition_root_wires_the_post_route_connectivity_guard() -> None:
+    # Without this injection the service silently skips the issue #1388 guard.
+    composition_root = boundaries.SRC_ROOT / "kicad_mcp" / "tools" / "schematic.py"
+    source = composition_root.read_text(encoding="utf-8")
+    assert "route_connectivity_groups=_connectivity_groups_for_text," in source

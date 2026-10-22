@@ -5952,6 +5952,22 @@ def build_connectivity_groups(sch_file: Path) -> list[dict[str, Any]]:
     return _build_connectivity_groups(sch_file)
 
 
+def _connectivity_groups_for_text(text: str) -> list[dict[str, Any]]:
+    """Return the connectivity groups of unsaved schematic ``text``.
+
+    The parser only reads files, so the text goes through a private temporary
+    file that is always removed.  Library symbols resolve through the active
+    project configuration, not the file's location.
+    """
+    with NamedTemporaryFile("w", suffix=".kicad_sch", delete=False, encoding="utf-8") as handle:
+        handle.write(text)
+        tmp_path = Path(handle.name)
+    try:
+        return _build_connectivity_groups(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 def _project_name() -> str:
     cfg = get_config()
     if cfg.project_file is not None:
@@ -7557,6 +7573,7 @@ def _register_authoring(mcp: FastMCP) -> None:
         route_avoiding_obstacles=_connectivity_route_avoiding_obstacles,
         run_auto_add_missing_junctions=run_auto_add_missing_junctions,
         snap_tolerance_mm=SNAP_TOLERANCE_MM,
+        route_connectivity_groups=_connectivity_groups_for_text,
     )
     schematic_connectivity_authoring.register(
         mcp,
