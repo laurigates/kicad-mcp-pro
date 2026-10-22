@@ -98,19 +98,25 @@ records each step that:
   `skip-github-release: true`, `softprops/action-gh-release` or
   `ncipollo/release-action`.
 
-A step targets a **draft** only when the same job has created the release
-with `--draft` (or `draft: true`) in an earlier step and has not published it
-yet. Everything else is treated as targeting a **published** release (fail
-closed).
+A command targets a **draft** only when the same job has created the release
+with `--draft` (or `draft: true`) earlier and has not published it yet. Every
+command is checked in order, including repeated commands in the same step.
+The draft window stays open for uploads, asset deletions and `gh release edit`
+calls that keep the draft. It closes on `gh release edit --draft=false` and on
+any other write whose effect on the draft is not known, such as a `gh api` or
+`curl` write (for example `-f draft=false`). Everything else is treated as
+targeting a **published** release (fail closed).
 
 Each published-release mutation must match an entry in the
 `release_asset_mutations` list in `.github/actions-policy.json`. The match key
 is workflow, job, step, kind and whether `--clobber` is used. Every entry must
-cite a tracking issue (currently `#1179`) and give a reason. The check fails
-when:
+cite a tracking issue (currently `#1179`) and give a reason. An entry covers
+exactly one matching command unless it sets `count`. The check fails when:
 
 - a new step mutates a published release without an entry;
 - an existing step changes its kind or its `--clobber` flag;
+- an allowlisted step gains or loses a matching command (the match count
+  differs from `count`, default 1);
 - an entry no longer matches any step (stale). Remove the entry when a step is
   migrated, so the list can only shrink.
 
@@ -124,9 +130,27 @@ uv run python scripts/check_release_asset_mutations.py
 uv run python scripts/check_release_asset_mutations.py --json  # full inventory
 ```
 
-Known limits: the checker parses shell text. It does not follow `eval`,
-variables that hold `gh`, or helper scripts that call the GitHub API. Review
-these by hand. The check is a ratchet, not a proof.
+Before splitting a `run` script into commands, the checker replaces GitHub
+`${{ ... }}` expressions and innermost `$(...)` or backtick substitutions with
+placeholders, and checks the substituted commands on their own. It also skips
+`env`, `sudo`, `xargs`, `nohup`, `nice` and `timeout` prefixes and their
+leading `-` options.
+
+Known limits: the checker parses shell text. Review these cases by hand:
+
+- It does not follow `eval`, variables that hold `gh`, shell functions, or
+  helper scripts that call the GitHub API.
+- Wrapper options that take a separate value (such as `xargs -I {}` or
+  `env -u NAME`) are not understood, so the command after them is missed.
+- Commands are matched by kind and count, not by their full text. Changing the
+  arguments of an allowlisted command (for example the asset list) is not
+  flagged.
+- Draft state is tracked only within one job. A draft created in another job,
+  another workflow or by Release Please (`release-please-config.json`, which
+  the checker does not read) is treated as published. See the migration note
+  below.
+
+The check is a ratchet, not a proof.
 
 ## Proposed draft-first orchestration (design only)
 
@@ -171,9 +195,27 @@ documentation before migration.
    failed draft is deleted and rebuilt. A published release that is missing
    assets is superseded by a new patch release instead of being edited.
 
-When a family is migrated, its `release_asset_mutations` entry stops matching
-(the step then targets a draft) and must be deleted. The ratchet reports it as
-stale until that happens.
+**Ratchet during migration.** The checker does not yet understand this design,
+so migrating a family is not just a matter of deleting allowlist entries:
+
+- The Release Please step in `publish-release.yml` stays classified as a
+  published `create_release` even with `"draft": true`, because the checker
+  does not read `release-please-config.json`. Its entry is not retired
+  automatically.
+- A `workflow_call` callee that attaches to a draft made by its caller is
+  classified as targeting a published release, because draft state is tracked
+  only within one job. A compliant upload without `--clobber` is reported as a
+  new mutation, and the old `clobber: true` entry is reported as stale.
+
+So the first migration change must extend the checker, with tests, to accept a
+declared draft target. For example, read `draft` from
+`release-please-config.json` for the Release Please step, and add a reviewed
+policy field (such as `target: draft`) for callee steps that attach only to a
+caller-provided draft and never use `--clobber`. Do not add ordinary
+`release_asset_mutations` entries for compliant steps. Those entries mean
+"mutates a published release" and would hide what the migration has
+achieved. Once a declared-draft mechanism exists, delete each family's old
+entry when it migrates. The ratchet reports an entry as stale until then.
 
 ## Non-goals
 

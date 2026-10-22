@@ -489,3 +489,164 @@ def test_cli_passes_on_repository() -> None:
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_same_step_upload_after_publish_is_not_deduplicated(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        _single_step_workflow(
+            """gh release create v1 --draft
+gh release upload v1 a
+gh release edit v1 --draft=false
+gh release upload v1 b"""
+        ),
+    )
+
+    entries = inventory(tmp_path)
+
+    assert [(entry.kind, entry.target_state) for entry in entries] == [
+        ("create_release", "draft"),
+        ("upload_asset", "draft"),
+        ("edit_release", "draft"),
+        ("upload_asset", "published"),
+    ]
+    errors = validate(entries, [])
+    assert len(errors) == 1
+    assert "gh release upload v1 b" in errors[0]
+
+
+def test_same_named_steps_upload_before_and_after_publish(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        """name: fixture
+on: push
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release create "$TAG" --draft
+      - name: s
+        run: gh release upload "$TAG" a
+      - name: p
+        run: gh release edit "$TAG" --draft=false
+      - name: s
+        run: gh release upload "$TAG" b
+""",
+    )
+
+    entries = inventory(tmp_path)
+
+    assert [entry.target_state for entry in entries if entry.step == "s"] == [
+        "draft",
+        "published",
+    ]
+    assert len(validate(entries, [])) == 1
+
+
+@pytest.mark.parametrize(
+    "publish",
+    [
+        "gh api -X PATCH repos/o/r/releases/1 -f draft=false",
+        'gh api --method PATCH "repos/$REPO/releases/$ID" --input publish.json',
+        'curl -X PATCH -d \'{"draft":false}\' "https://api.github.com/repos/o/r/releases/1"',
+    ],
+)
+def test_api_write_closes_the_draft_window(tmp_path: Path, publish: str) -> None:
+    _write_workflow(
+        tmp_path,
+        f"""name: fixture
+on: push
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh release create "$TAG" --draft
+      - name: Publish via API
+        run: {json.dumps(publish)}
+      - name: Late evidence
+        run: gh release upload "$TAG" x --clobber
+""",
+    )
+
+    entries = inventory(tmp_path)
+
+    assert [(entry.step, entry.kind, entry.target_state) for entry in entries][1:] == [
+        ("Publish via API", "api_write", "draft"),
+        ("Late evidence", "upload_asset", "published"),
+    ]
+    errors = validate(entries, [])
+    assert len(errors) == 1
+    assert "Late evidence" in errors[0]
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        'gh release upload "${{ inputs.tag || github.ref_name }}" f --clobber',
+        'gh release upload "$(cat tag.txt)" f --clobber',
+        'gh release upload "`cat tag.txt`" f --clobber',
+        "env GH_TOKEN=x gh release upload v1 f --clobber",
+        "sudo -E gh release upload v1 f --clobber",
+        "ls f | xargs gh release upload v1 --clobber",
+    ],
+)
+def test_expressions_substitutions_and_wrappers_keep_the_whole_command(
+    tmp_path: Path, run: str
+) -> None:
+    _write_workflow(tmp_path, _single_step_workflow(run))
+
+    entries = inventory(tmp_path)
+
+    assert [(entry.kind, entry.clobber, entry.target_state) for entry in entries] == [
+        ("upload_asset", True, "published")
+    ]
+    assert validate(entries, [_entry()]) == []
+
+
+def test_command_substitution_contents_are_still_inspected(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        _single_step_workflow('id="$(gh api -X POST "repos/$REPO/releases" -f tag_name=v1)"'),
+    )
+
+    assert [entry.kind for entry in inventory(tmp_path)] == ["api_write"]
+
+
+def test_new_command_in_allowlisted_step_is_rejected(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        _single_step_workflow(
+            """gh release upload "$TAG" x --clobber
+gh release upload "$TAG" y --clobber"""
+        ),
+    )
+
+    entries = inventory(tmp_path)
+    errors = validate(entries, [_entry()])
+
+    assert len(entries) == 2
+    assert len(errors) == 1
+    assert "2 matching command(s)" in errors[0]
+    assert validate(entries, [_entry(count=2)]) == []
+
+
+@pytest.mark.parametrize("count", [0, -1, "2", True, 1.5])
+def test_allowlist_count_must_be_positive_integer(tmp_path: Path, count: object) -> None:
+    _write_workflow(tmp_path, _single_step_workflow('gh release upload "$TAG" x --clobber'))
+
+    errors = validate(inventory(tmp_path), [_entry(count=count)])
+
+    assert any("count must be a positive integer" in error for error in errors)
+
+
+def test_allowlist_count_above_matches_is_rejected(tmp_path: Path) -> None:
+    _write_workflow(tmp_path, _single_step_workflow('gh release upload "$TAG" x --clobber'))
+
+    errors = validate(inventory(tmp_path), [_entry(count=2)])
+
+    assert len(errors) == 1
+    assert "1 matching command(s)" in errors[0]
