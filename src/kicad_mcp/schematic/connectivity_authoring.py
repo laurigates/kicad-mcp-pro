@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from ..errors import SchematicRoutingUnsafeError
+from ..errors import SchematicRoutingUnsafeError, ToolValidationError
 from ..models.schematic import RouteWireBetweenPinsInput
 from .references import power_reference_from_uuid
 
@@ -84,17 +84,26 @@ def _group_pin_keys(group: ConnectivityGroup) -> set[tuple[str, str]]:
 
 
 def _find_endpoint_group(groups: list[ConnectivityGroup], endpoint: RouteEndpoint) -> int | None:
-    """Index of the group holding ``reference:pin``, else the one at ``point``.
+    """Index of the group holding ``reference:pin`` at ``point``, else a fallback.
 
     Symbol pins are matched by identity, so a route that lands beside the real
-    (for example mirrored) pin is not mistaken for connecting it.  Power symbols
-    carry no pin entries, so they fall back to their anchor point.
+    (for example mirrored) pin is not mistaken for connecting it.  A pin shared
+    by every unit of a multi-unit symbol (declared in unit 0) appears once per
+    placed unit at different positions, so the copy at ``point`` wins; identity
+    alone decides only when the pin is unique.  Power symbols carry no pin
+    entries, so they fall back to their anchor point.
     """
     reference, pin, point = endpoint
-    for index, group in enumerate(groups):
-        if (reference, pin) in _group_pin_keys(group):
-            return index
     key = _point_key(*point)
+    holders = [
+        index for index, group in enumerate(groups) if (reference, pin) in _group_pin_keys(group)
+    ]
+    for index in holders:
+        if key in _group_point_keys(groups[index]):
+            return index
+    if holders:
+        # Off every copy of the pin: only an unambiguous pin can be resolved.
+        return holders[0] if len(holders) == 1 else None
     for index, group in enumerate(groups):
         if key in _group_point_keys(group):
             return index
@@ -128,7 +137,10 @@ def route_merge_violation(
     any other net -- pins, labels, power symbols or no-connect markers reached by
     collinear overlap, a T-junction, a shared wire endpoint or a connection point
     on the path -- or when the two endpoint nets already carry different names.
-    A dangling unnamed wire without pins is not a net and may be absorbed.
+    Every resulting group is checked, not only the endpoints' one, so wires that
+    join two other nets with each other away from the path (for example a stray
+    segment from a faulty router) are refused too.  A dangling unnamed wire
+    without pins is not a net and may be absorbed.
     """
     post_start = _find_endpoint_group(post, start)
     post_end = _find_endpoint_group(post, end)
@@ -137,21 +149,29 @@ def route_merge_violation(
             f"the route does not connect {start[0]}:{start[1]} to {end[0]}:{end[1]} "
             "in the resulting connectivity"
         )
-    merged_points = _group_point_keys(post[post_start])
 
     pre_start = _find_endpoint_group(pre, start)
     pre_end = _find_endpoint_group(pre, end)
     own = {index for index in (pre_start, pre_end) if index is not None}
-
-    absorbed = [
-        _describe_group(group)
+    foreign = [
+        (group, _group_point_keys(group))
         for index, group in enumerate(pre)
-        if index not in own
-        and (group.get("pins") or group.get("names") or group.get("no_connect"))
-        and _group_point_keys(group) & merged_points
+        if index not in own and (group.get("pins") or group.get("names") or group.get("no_connect"))
     ]
+
+    def joined_into(post_group: ConnectivityGroup) -> list[str]:
+        points = _group_point_keys(post_group)
+        return [_describe_group(group) for group, keys in foreign if keys & points]
+
+    absorbed = joined_into(post[post_start])
     if absorbed:
         return "the route would merge another net " + "; ".join(absorbed)
+    for index, post_group in enumerate(post):
+        if index == post_start:
+            continue
+        bridged = joined_into(post_group)
+        if len(bridged) >= 2:
+            return "the route would merge other nets with each other: " + "; ".join(bridged)
 
     if pre_start is not None and pre_end is not None and pre_start != pre_end:
         start_names = [f"'{name}'" for name in pre[pre_start].get("names", [])]
@@ -232,7 +252,8 @@ class SchematicConnectivityAuthoringService:
     get_module_boundaries: Callable[[str], list[BoundingBoxLike]] = _no_module_boundaries
     #: Builds the electrical connectivity groups of a schematic text (the shape of
     #: ``_build_connectivity_groups``).  When wired, every route is checked against
-    #: the before/after connectivity of the exact text being written and refused if
+    #: the before/after connectivity of the mutator's text (prior to the writer's
+    #: wire normalization) and refused if
     #: it would join any net other than its two endpoints' nets (issue #1388).
     #: ``None`` skips the check for callers that predate it; the composition root
     #: always wires it.
@@ -644,10 +665,12 @@ class SchematicConnectivityAuthoringService:
         }
         first = symbols.get(payload.ref1)
         second = symbols.get(payload.ref2)
+        # Unknown endpoints are refusals: raise a typed error so the tool result
+        # is a failure with a stable code, never success text (issue #1388).
         if first is None:
-            return f"Reference '{payload.ref1}' was not found in the schematic."
+            raise ToolValidationError(f"Reference '{payload.ref1}' was not found in the schematic.")
         if second is None:
-            return f"Reference '{payload.ref2}' was not found in the schematic."
+            raise ToolValidationError(f"Reference '{payload.ref2}' was not found in the schematic.")
 
         first_library, first_symbol = self.split_lib_id(str(first["lib_id"]))
         second_library, second_symbol = self.split_lib_id(str(second["lib_id"]))
@@ -670,9 +693,9 @@ class SchematicConnectivityAuthoringService:
         start = first_pins.get(payload.pin1)
         end = second_pins.get(payload.pin2)
         if start is None:
-            return f"Pin {payload.pin1} was not found on {payload.ref1}."
+            raise ToolValidationError(f"Pin {payload.pin1} was not found on {payload.ref1}.")
         if end is None:
-            return f"Pin {payload.pin2} was not found on {payload.ref2}."
+            raise ToolValidationError(f"Pin {payload.pin2} was not found on {payload.ref2}.")
 
         # The direction each wire must leave and reach its pin in.  Without this
         # the search may leave a pin sideways for free, which turns at the pin
@@ -702,23 +725,28 @@ class SchematicConnectivityAuthoringService:
             boundaries,
         )
         crossings = self.count_net_crossings(segments, occupied)
-        if not segments:
-            return (
-                f"{payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2} already overlap."
-            )
+        refusal_prefix = (
+            f"Route refused between {payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2}"
+        )
         # A failed search may return its direct, potentially shorting fallback.
         # Only the explicitly reviewed perpendicular-crossing warning permits a
         # write; all other warnings must leave the schematic unchanged.
         if routing_warning and routing_warning != "WARNING: net_crossing_unavoidable":
             raise SchematicRoutingUnsafeError(
-                f"Route refused between {payload.ref1}:{payload.pin1} and "
-                f"{payload.ref2}:{payload.pin2}: {routing_warning}. "
+                f"{refusal_prefix}: {routing_warning}. No schematic changes were made."
+            )
+        if not segments:
+            # Coincident pins are already connected, so there is nothing to
+            # write; an empty route between distinct points connects nothing.
+            if _point_key(*start) == _point_key(*end):
+                return (
+                    f"{payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2} "
+                    "already overlap."
+                )
+            raise SchematicRoutingUnsafeError(
+                f"{refusal_prefix}: the router produced no wire segments. "
                 "No schematic changes were made."
             )
-
-        refusal_prefix = (
-            f"Route refused between {payload.ref1}:{payload.pin1} and {payload.ref2}:{payload.pin2}"
-        )
 
         def mutator(current: str) -> str:
             updated = current
@@ -727,8 +755,10 @@ class SchematicConnectivityAuthoringService:
                     updated,
                     self.wire_block(*segment),
                 )
-            # Judge the exact text being written, under the write lock, so an edit
-            # landing between the read above and this write is checked too.
+            # Judge the mutator's output under the write lock, so an edit landing
+            # between the read above and this write is checked too.  This is the
+            # text before the transactional writer's wire normalization (dedupe
+            # and T-junctions), which the connectivity model already unions.
             # Raising here aborts the write and leaves the file untouched.
             self._guard_route_connectivity(
                 current,

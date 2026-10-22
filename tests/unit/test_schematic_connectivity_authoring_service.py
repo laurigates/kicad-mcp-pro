@@ -7,10 +7,11 @@ from typing import Any
 
 import pytest
 
-from kicad_mcp.errors import SchematicRoutingUnsafeError
+from kicad_mcp.errors import SchematicRoutingUnsafeError, ToolValidationError
 from kicad_mcp.schematic.connectivity_authoring import (
     BoundingBoxLike,
     SchematicConnectivityAuthoringService,
+    route_merge_violation,
 )
 
 
@@ -450,20 +451,40 @@ def test_route_wire_between_pins_reports_missing_reference_and_pin(tmp_path: Pat
         tmp_path,
         parsed={"symbols": [_symbol("U1")], "power_symbols": []},
     )
-    assert (
+    # Unknown endpoints are refusals, so they must surface as failed tool
+    # results with a stable code rather than as success text (issue #1388).
+    with pytest.raises(ToolValidationError) as missing_ref_error:
         missing_ref.service.route_wire_between_pins("U1", "1", "R404", "2")
-        == "Reference 'R404' was not found in the schematic."
-    )
+    assert str(missing_ref_error.value) == "Reference 'R404' was not found in the schematic."
+    assert missing_ref_error.value.to_payload()["code"] == "TOOL_VALIDATION_ERROR"
+    assert missing_ref.writes == []
 
     missing_pin = _harness(
         tmp_path,
         parsed={"symbols": [_symbol("U1"), _symbol("R1")], "power_symbols": []},
         pin_positions={("Device", "R"): {}},
     )
-    assert (
+    with pytest.raises(ToolValidationError) as missing_pin_error:
         missing_pin.service.route_wire_between_pins("U1", "1", "R1", "2")
-        == "Pin 1 was not found on U1."
+    assert str(missing_pin_error.value) == "Pin 1 was not found on U1."
+    assert missing_pin.writes == []
+
+
+def test_route_wire_between_pins_refuses_empty_route_between_distinct_points(
+    tmp_path: Path,
+) -> None:
+    harness = _harness(
+        tmp_path,
+        parsed={"symbols": [_symbol("U1"), _symbol("R1")], "power_symbols": []},
+        pin_positions={("Device", "R"): {"1": (1.0, 1.0), "2": (5.0, 5.0)}},
+        route_segments=[],
     )
+
+    with pytest.raises(SchematicRoutingUnsafeError) as error:
+        harness.service.route_wire_between_pins("U1", "1", "R1", "2")
+
+    assert "produced no wire segments" in str(error.value)
+    assert harness.writes == []
 
 
 def test_route_wire_between_pins_reports_overlap_without_write(tmp_path: Path) -> None:
@@ -989,6 +1010,85 @@ def test_route_guard_still_allows_reviewed_crossing_warning(tmp_path: Path) -> N
 
     assert "WARNING: net_crossing_unavoidable" in result
     assert len(harness.writes) == 1
+
+
+def test_merge_guard_accepts_route_to_common_pin_of_second_unit() -> None:
+    # A unit-0 pin is repeated on every placed unit at a different position;
+    # the route lands on the copy at its end point, not the first one listed.
+    r1 = _group([("R1", "2")], [(101.6, 25.4)])
+    unit_a = _group([("U3", "8")], [(50.8, 43.18)])
+    unit_b = _group([("U3", "8")], [(101.6, 43.18)])
+    merged = _group([("R1", "2"), ("U3", "8")], [(101.6, 25.4), (101.6, 43.18)])
+
+    reason = route_merge_violation(
+        [r1, unit_a, unit_b],
+        [unit_a, merged],
+        ("R1", "2", (101.6, 25.4)),
+        ("U3", "8", (101.6, 43.18)),
+    )
+
+    assert reason is None
+
+
+def test_merge_guard_refuses_when_route_misses_every_copy_of_a_repeated_pin() -> None:
+    r1 = _group([("R1", "2")], [(101.6, 25.4)])
+    unit_a = _group([("U3", "8")], [(50.8, 43.18)])
+    unit_b = _group([("U3", "8")], [(101.6, 43.18)])
+    stray = _group([("R1", "2")], [(101.6, 25.4), (90.0, 43.18)])
+
+    reason = route_merge_violation(
+        [r1, unit_a, unit_b],
+        [unit_a, unit_b, stray],
+        ("R1", "2", (101.6, 25.4)),
+        ("U3", "8", (90.0, 43.18)),
+    )
+
+    assert reason is not None
+    assert "does not connect R1:2 to U3:8" in reason
+
+
+def test_merge_guard_refuses_disjoint_segment_bridging_two_foreign_nets() -> None:
+    # A faulty router emits a stray segment (5,20)->(10,20) away from the path.
+    r1 = _group([("R1", "1")], [(0.0, 0.0)])
+    r2 = _group([("R2", "1")], [(10.0, 0.0)])
+    dp = _group([("U1", "33")], [(0.0, 20.0), (5.0, 20.0)], ["USB_DP"])
+    dm = _group([("U1", "32")], [(10.0, 20.0), (15.0, 20.0)], ["USB_DM"])
+    joined = _group([("R1", "1"), ("R2", "1")], [(0.0, 0.0), (10.0, 0.0)])
+    shorted = _group(
+        [("U1", "33"), ("U1", "32")],
+        [(0.0, 20.0), (5.0, 20.0), (10.0, 20.0), (15.0, 20.0)],
+        ["USB_DM", "USB_DP"],
+    )
+
+    reason = route_merge_violation(
+        [r1, r2, dp, dm],
+        [joined, shorted],
+        ("R1", "1", (0.0, 0.0)),
+        ("R2", "1", (10.0, 0.0)),
+    )
+
+    assert reason is not None
+    assert "would merge other nets" in reason
+    assert "USB_DP" in reason
+    assert "USB_DM" in reason
+
+
+def test_merge_guard_allows_disjoint_segment_touching_one_foreign_net() -> None:
+    # Extending a foreign net with a dangling stub joins nothing to anything.
+    r1 = _group([("R1", "1")], [(0.0, 0.0)])
+    r2 = _group([("R2", "1")], [(10.0, 0.0)])
+    dp = _group([("U1", "33")], [(0.0, 20.0), (5.0, 20.0)], ["USB_DP"])
+    joined = _group([("R1", "1"), ("R2", "1")], [(0.0, 0.0), (10.0, 0.0)])
+    extended = _group([("U1", "33")], [(0.0, 20.0), (5.0, 20.0), (8.0, 20.0)], ["USB_DP"])
+
+    reason = route_merge_violation(
+        [r1, r2, dp],
+        [joined, extended],
+        ("R1", "1", (0.0, 0.0)),
+        ("R2", "1", (10.0, 0.0)),
+    )
+
+    assert reason is None
 
 
 def test_route_guard_fails_closed_when_connectivity_cannot_be_built(tmp_path: Path) -> None:

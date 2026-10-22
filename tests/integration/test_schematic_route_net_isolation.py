@@ -352,3 +352,91 @@ async def test_obstacle_bypass_failure_is_a_failed_tool_result(
     text = await _assert_refused_unchanged(server, sch_file, "J1", "A6", "U2", "3")
 
     assert "obstacle_bypass_failed" in text
+
+
+async def test_unknown_reference_or_pin_is_a_failed_tool_result(
+    sample_project: Path, mock_kicad: MagicMock
+) -> None:
+    server = await _usb_server(sample_project)
+    sch_file = sample_project / "demo.kicad_sch"
+
+    for ref1, pin1, ref2, pin2, expected in (
+        ("U9", "1", "U2", "3", "Reference 'U9' was not found in the schematic."),
+        ("J1", "A6", "U9", "3", "Reference 'U9' was not found in the schematic."),
+        ("U1", "99", "U2", "3", "Pin 99 was not found on U1."),
+        ("J1", "A6", "U2", "99", "Pin 99 was not found on U2."),
+    ):
+        before = sch_file.read_bytes()
+        result = await _route(server, ref1, pin1, ref2, pin2)
+        text = _text(result)
+        assert result.is_error is True, text
+        assert text.startswith("TOOL_VALIDATION_ERROR: "), text
+        assert expected in text
+        assert sch_file.read_bytes() == before
+
+
+# Two-unit part whose pin 8 is common to every unit (declared in unit 0), the
+# way supply pins of dual op-amps are, so each placed unit carries its own copy.
+DUAL_LIB = """(kicad_symbol_lib (version 20250316) (generator pytest)
+  (symbol "Dual"
+    (property "Reference" "U" (id 0) (at 0 7.62 0))
+    (property "Value" "Dual" (id 1) (at 0 -7.62 0))
+    (symbol "Dual_0_1"
+      (rectangle (start -5.08 -5.08) (end 5.08 5.08))
+      (pin power_in line (at 0 7.62 270) (length 2.54) (name "V+") (number "8"))
+    )
+    (symbol "Dual_1_1"
+      (pin passive line (at -7.62 0 0) (length 2.54) (name "A") (number "1"))
+    )
+    (symbol "Dual_2_1"
+      (pin passive line (at -7.62 0 0) (length 2.54) (name "B") (number "2"))
+    )
+  )
+)
+"""
+
+
+async def test_route_to_common_pin_of_multi_unit_symbol_is_not_refused(
+    sample_project: Path, mock_kicad: MagicMock
+) -> None:
+    (sample_project.parent / "symbols" / "Dual.kicad_sym").write_text(DUAL_LIB, encoding="utf-8")
+    server = build_server("schematic")
+    await call_tool_text(server, "kicad_set_project", {"project_dir": str(sample_project)})
+    for unit, x in ((1, 50.8), (2, 101.6)):
+        await call_tool_text(
+            server,
+            "sch_add_symbol",
+            {
+                "library": "Dual",
+                "symbol_name": "Dual",
+                "x_mm": x,
+                "y_mm": 50.8,
+                "reference": "U3",
+                "value": "Dual",
+                "unit": unit,
+            },
+        )
+    await call_tool_text(
+        server,
+        "sch_add_symbol",
+        {
+            "library": "Device",
+            "symbol_name": "R",
+            "x_mm": 101.6,
+            "y_mm": 25.4,
+            "reference": "R1",
+            "value": "10k",
+        },
+    )
+    sch_file = sample_project / "demo.kicad_sch"
+    shared = [group for group in _groups(sch_file) if ("U3", "8") in group]
+    assert len(shared) == 2  # one copy of the common pin per placed unit
+    before = sch_file.read_bytes()
+
+    result = await _route(server, "R1", "2", "U3", "8")
+
+    text = _text(result)
+    assert result.is_error is False, text
+    assert "Routed" in text
+    assert sch_file.read_bytes() != before
+    assert any({("R1", "2"), ("U3", "8")} <= group for group in _groups(sch_file))
