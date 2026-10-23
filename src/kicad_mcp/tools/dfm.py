@@ -25,6 +25,7 @@ from ..validation import drc_runner
 from ..validation.drc_report import courtyard_violations, report_entries
 from .export_support import _ensure_output_dir, _get_pcb_file, _run_cli_variants
 from .metadata import headless_compatible
+from .pth_annular_audit import audit_pth_annular_ring_lines
 
 logger = structlog.get_logger(__name__)
 DEFAULT_PROFILE = ("JLCPCB", "standard")
@@ -317,6 +318,44 @@ def _check_drc_report_lines(
     return lines, 4
 
 
+def _check_jlcpcb_pth_2layer_process_lines(
+    *,
+    manufacturer: str,
+    rules: dict[str, float | int],
+    copper_layers: int | None,
+) -> list[str]:
+    """Require fab approval even when a partial nominal round-pad scan runs.
+
+    Native metrics include vias and DRC, not individual finished PTH geometry.
+    A separate source-only nominal circular-pad audit may follow when available.
+    """
+    if manufacturer.upper() != "JLCPCB" or copper_layers != 2:
+        return []
+    minimum = rules.get("min_pth_annular_ring_2layer_1oz_mm")
+    if minimum is None:
+        return [
+            _format_status(
+                "WARN",
+                "JLCPCB 2-layer/1-oz PTH minimum is not configured; "
+                "individual PTH annular lands require written CAM acceptance.",
+            )
+        ]
+    preferred = rules.get("recommended_pth_annular_ring_2layer_1oz_mm")
+    return [
+        _format_status(
+            "WARN",
+            f"JLCPCB 2-layer/1-oz PTH annular ring absolute minimum "
+            f"{float(minimum):.3f} mm"
+            + (f", recommended {float(preferred):.3f} mm" if preferred is not None else "")
+            + "; published values apply to 1-oz copper (actual copper weight "
+            "is not checked). A separate source-board scan may measure simple "
+            "nominal circular PTH rings only; noncircular PTH, plated slots and "
+            "finished hole tolerances are not measured. Verify copper weight, "
+            "real land/hole geometry and obtain written CAM signoff before fabrication.",
+        )
+    ]
+
+
 def _dfm_check_lines(
     profile: dict[str, Any],
     *,
@@ -324,19 +363,52 @@ def _dfm_check_lines(
 ) -> list[str]:
     rules = cast(dict[str, float | int], profile["rules"])
     metrics = _board_metrics()
-    _, report, error = _run_drc_report("dfm_profile_check.json")
+    try:
+        _, report, error = _run_drc_report("dfm_profile_check.json")
+    except (ValueError, OSError):
+        # A missing/unreadable project board cannot be a DFM PASS. Keep the
+        # saved-PTH review reachable and report unavailable native DRC.
+        report, error = None, "saved PCB source unavailable"
     report_status, classification_error = drc_runner.classify_legacy_drc_result(report, error)
     if report_status in {"unavailable", "malformed"}:
         report = None
 
     metric_lines, metric_checks = _check_board_metrics_rules(metrics, rules)
     drc_lines, drc_checks = _check_drc_report_lines(report, report_status, classification_error)
+    pth_process_lines = _check_jlcpcb_pth_2layer_process_lines(
+        manufacturer=str(profile["manufacturer"]),
+        rules=rules,
+        copper_layers=int(metrics["copper_layers"])
+        if metrics["copper_layers"] is not None
+        else None,
+    )
+
+    # Source-only circular PTH scan; no claim that the installed KiCad board,
+    # fabricated copper weight or CAM finished drill tolerances are qualified.
+    if str(profile["manufacturer"]).upper() == "JLCPCB" and metrics["copper_layers"] == 2:
+        minimum = rules.get("min_pth_annular_ring_2layer_1oz_mm")
+        if minimum is not None:
+            try:
+                pth_process_lines.extend(
+                    audit_pth_annular_ring_lines(
+                        _get_pcb_file().read_text(encoding="utf-8"), float(minimum)
+                    )
+                )
+            except (OSError, ValueError):
+                pth_process_lines.append(
+                    _format_status(
+                        "WARN",
+                        "Saved PCB PTH geometry unavailable; "
+                        "individual pads/slots remain unverified for written CAM approval.",
+                    )
+                )
 
     lines = [
         heading or "DFM profile check:",
         f"- Profile: {profile['manufacturer']} / {profile['tier']}",
         *metric_lines,
         *drc_lines,
+        *pth_process_lines,
         _format_status(
             "WARN",
             "Manual review: annular ring, copper-to-edge, and silkscreen text size "
