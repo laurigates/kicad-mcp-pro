@@ -24,7 +24,9 @@ import re
 import shlex
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -106,6 +108,11 @@ class ReleaseMutation:
         return f"{self.workflow}:{self.job}:{self.step}"
 
 
+def _extract_substitution(found: list[str], match: re.Match[str]) -> str:
+    found.append(match.group(1) if match.group(1) is not None else match.group(2))
+    return _SUBSTITUTION_PLACEHOLDER
+
+
 def split_shell_commands(script: str) -> list[str]:
     """Split a ``run`` script into simple command segments.
 
@@ -128,15 +135,11 @@ def split_shell_commands(script: str) -> list[str]:
         while pending:
             text = pending.pop(0)
             inner: list[str] = []
-
-            def _extract(match: re.Match[str], found: list[str] = inner) -> str:
-                found.append(match.group(1) if match.group(1) is not None else match.group(2))
-                return _SUBSTITUTION_PLACEHOLDER
-
+            extract = partial(_extract_substitution, inner)
             previous = None
             while previous != text:
                 previous = text
-                text = _SUBSTITUTION.sub(_extract, text)
+                text = _SUBSTITUTION.sub(extract, text)
             for part in _SEPARATORS.split(text):
                 normalised = " ".join(part.split())
                 if normalised:
@@ -218,7 +221,7 @@ def _classify_segment(segment: str) -> _Match | None:
         return None
     if program == "curl":
         rest = tokens[1:]
-        if any("uploads.github.com" in token for token in rest):
+        if any(_url_host(token) == "uploads.github.com" for token in rest):
             return _Match("upload_asset", False, None, segment)
         if any("/releases" in token for token in rest):
             method = _flag_value(rest, "-X", "--request")
@@ -227,6 +230,12 @@ def _classify_segment(segment: str) -> _Match | None:
             if method is not None and method.upper() in _WRITE_METHODS:
                 return _Match("api_write", False, None, segment)
     return None
+
+
+def _url_host(token: str) -> str | None:
+    if not token.startswith(("https://", "http://")):
+        return None
+    return urlsplit(token).hostname
 
 
 def _truthy(value: object) -> bool:

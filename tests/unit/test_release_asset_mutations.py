@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,12 +12,12 @@ from scripts.check_github_actions_policy import load_policy
 from scripts.check_release_asset_mutations import (
     ReleaseMutation,
     inventory,
+    main,
     split_shell_commands,
     validate,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "scripts" / "check_release_asset_mutations.py"
 
 
 def _write_workflow(root: Path, body: str, name: str = "test.yml") -> None:
@@ -452,43 +450,25 @@ jobs:
     assert [entry.step for entry in inventory(tmp_path)] == ["upload-one", "#2"]
 
 
-def test_cli_reports_inventory_and_fails_on_unlisted_mutation(tmp_path: Path) -> None:
+def test_cli_reports_inventory_and_fails_on_unlisted_mutation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     _write_workflow(tmp_path, _single_step_workflow('gh release upload "$TAG" x --clobber'))
     policy = tmp_path / ".github" / "actions-policy.json"
     policy.write_text(json.dumps({"release_asset_mutations": []}), encoding="utf-8")
+    argv = ["--root", str(tmp_path), "--policy", str(policy)]
 
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT), "--root", str(tmp_path), "--policy", str(policy)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode == 1
-    assert "not allowlisted" in result.stdout
+    assert main(argv) == 1
+    assert "not allowlisted" in capsys.readouterr().out
 
     policy.write_text(json.dumps({"release_asset_mutations": [_entry()]}), encoding="utf-8")
-    ok = subprocess.run(
-        [sys.executable, str(SCRIPT), "--root", str(tmp_path), "--policy", str(policy)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
 
-    assert ok.returncode == 0, ok.stdout + ok.stderr
-    assert "1 allowlisted post-publication mutation" in ok.stdout
+    assert main(argv) == 0
+    assert "1 allowlisted post-publication mutation" in capsys.readouterr().out
 
 
-def test_cli_passes_on_repository() -> None:
-    result = subprocess.run(
-        [sys.executable, str(SCRIPT)],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=ROOT,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
+def test_cli_passes_on_repository(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["--root", str(ROOT)]) == 0, capsys.readouterr().out
 
 
 def test_same_step_upload_after_publish_is_not_deduplicated(tmp_path: Path) -> None:
@@ -650,3 +630,14 @@ def test_allowlist_count_above_matches_is_rejected(tmp_path: Path) -> None:
 
     assert len(errors) == 1
     assert "1 matching command(s)" in errors[0]
+
+
+def test_curl_upload_requires_uploads_host_not_substring(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        _single_step_workflow(
+            'curl -sS -o x.zip "https://example.com/mirror/uploads.github.com/x.zip"'
+        ),
+    )
+
+    assert inventory(tmp_path) == []
