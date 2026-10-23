@@ -572,6 +572,12 @@ jobs:
         "env GH_TOKEN=x gh release upload v1 f --clobber",
         "sudo -E gh release upload v1 f --clobber",
         "ls f | xargs gh release upload v1 --clobber",
+        "timeout 60 gh release upload v1 f --clobber",
+        "timeout -k 5 -s TERM 60 gh release upload v1 f --clobber",
+        "nice -n 10 gh release upload v1 f --clobber",
+        "sudo -u bot gh release upload v1 f --clobber",
+        "env -u GH_DEBUG gh release upload v1 f --clobber",
+        "ls f | xargs -I {} gh release upload v1 {} --clobber",
     ],
 )
 def test_expressions_substitutions_and_wrappers_keep_the_whole_command(
@@ -641,3 +647,27 @@ def test_curl_upload_requires_uploads_host_not_substring(tmp_path: Path) -> None
     )
 
     assert inventory(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "publish",
+    [
+        'gh release edit "$TAG" --draft=0',
+        'gh release edit "$TAG" --draft=False',
+        'gh release edit "$TAG" --draft="$PUBLISH"',
+        'gh release edit "$TAG" --draft=${{ inputs.draft }}',
+    ],
+)
+def test_unrecognised_draft_value_closes_the_draft_window(tmp_path: Path, publish: str) -> None:
+    _write_workflow(
+        tmp_path,
+        _single_step_workflow(
+            f'gh release create "$TAG" --draft\n{publish}\ngh release upload "$TAG" x'
+        ),
+    )
+
+    entries = inventory(tmp_path)
+
+    assert entries[-1].kind == "upload_asset"
+    assert entries[-1].target_state == "published"
+    assert len(validate(entries, [])) == 1

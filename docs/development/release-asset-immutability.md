@@ -102,7 +102,8 @@ A command targets a **draft** only when the same job has created the release
 with `--draft` (or `draft: true`) earlier and has not published it yet. Every
 command is checked in order, including repeated commands in the same step.
 The draft window stays open for uploads, asset deletions and `gh release edit`
-calls that keep the draft. It closes on `gh release edit --draft=false` and on
+calls that keep the draft. It closes on `gh release edit --draft=<value>` for
+any value other than `true` or `1` (including `$VAR` and `${{ ... }}`), and on
 any other write whose effect on the draft is not known, such as a `gh api` or
 `curl` write (for example `-f draft=false`). Everything else is treated as
 targeting a **published** release (fail closed).
@@ -133,8 +134,9 @@ uv run python scripts/check_release_asset_mutations.py --json  # full inventory
 Before splitting a `run` script into commands, the checker replaces GitHub
 `${{ ... }}` expressions and innermost `$(...)` or backtick substitutions with
 placeholders, and checks the substituted commands on their own. It also skips
-`env`, `sudo`, `xargs`, `nohup`, `nice` and `timeout` prefixes and their
-leading `-` options.
+`env`, `sudo`, `xargs`, `nohup`, `nice` and `timeout` prefixes, their leading
+`-` options with any separate option value (`nice -n 10`, `sudo -u bot`), and
+the `timeout` duration.
 
 Known limits: the checker parses shell text. Review these cases by hand:
 

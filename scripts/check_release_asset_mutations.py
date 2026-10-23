@@ -74,6 +74,52 @@ _SHELL_PREFIX_TOKENS = {
 }
 # Wrappers that run the following command; their leading ``-x`` options are skipped too.
 _WRAPPER_TOKENS = {"env", "sudo", "xargs", "nohup", "nice", "timeout"}
+# Wrapper options whose value is a separate argument (``-n 10``), so it is skipped as well.
+_WRAPPER_VALUE_OPTIONS = {
+    "env": {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"},
+    "sudo": {
+        "-u",
+        "--user",
+        "-g",
+        "--group",
+        "-C",
+        "--close-from",
+        "-D",
+        "--chdir",
+        "-h",
+        "--host",
+        "-p",
+        "--prompt",
+        "-r",
+        "--role",
+        "-t",
+        "--type",
+        "-T",
+        "--command-timeout",
+        "-U",
+        "--other-user",
+    },
+    "xargs": {
+        "-a",
+        "--arg-file",
+        "-d",
+        "--delimiter",
+        "-E",
+        "-I",
+        "-L",
+        "-n",
+        "--max-args",
+        "-P",
+        "--max-procs",
+        "-s",
+        "--max-chars",
+        "--process-slot-var",
+    },
+    "nice": {"-n", "--adjustment"},
+    "timeout": {"-k", "--kill-after", "-s", "--signal"},
+}
+# Wrappers with required positional arguments before the command (``timeout DURATION``).
+_WRAPPER_POSITIONALS = {"timeout": 1}
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SEPARATORS = re.compile(r"\n|&&|\|\||;|\||\$\(|`")
 _GHA_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
@@ -148,6 +194,18 @@ def split_shell_commands(script: str) -> list[str]:
     return segments
 
 
+def _skip_wrapper(wrapper: str, tokens: list[str]) -> list[str]:
+    value_options = _WRAPPER_VALUE_OPTIONS.get(wrapper, set())
+    while tokens and tokens[0].startswith("-"):
+        option = tokens[0]
+        tokens = tokens[1:]
+        if option == "--":
+            break
+        if option in value_options and tokens:
+            tokens = tokens[1:]
+    return tokens[_WRAPPER_POSITIONALS.get(wrapper, 0) :]
+
+
 def _tokens(segment: str) -> list[str]:
     try:
         tokens = shlex.split(segment, comments=False)
@@ -158,9 +216,7 @@ def _tokens(segment: str) -> list[str]:
         if head in _SHELL_PREFIX_TOKENS or _ENV_ASSIGNMENT.match(head):
             tokens = tokens[1:]
         elif head.rsplit("/", 1)[-1] in _WRAPPER_TOKENS:
-            tokens = tokens[1:]
-            while tokens and tokens[0].startswith("-"):
-                tokens = tokens[1:]
+            tokens = _skip_wrapper(head.rsplit("/", 1)[-1], tokens[1:])
         else:
             break
     return tokens
@@ -180,13 +236,17 @@ def _flag_value(tokens: list[str], short: str | None, long: str) -> str | None:
 
 
 def _draft_flag(tokens: list[str]) -> bool | None:
-    """Return True for ``--draft``, False for ``--draft=false``, None when absent."""
+    """Return True for ``--draft``/``--draft=true``, None when absent, else False.
+
+    Any other ``--draft=<value>`` (``0``, ``$VAR``, a ``${{ }}`` expression) is
+    treated as published, so an unknown effect closes the draft window.
+    """
 
     for arg in tokens:
-        if arg in {"--draft", "-d", "--draft=true"}:
+        if arg in {"--draft", "-d"}:
             return True
-        if arg == "--draft=false":
-            return False
+        if arg.startswith("--draft="):
+            return arg.split("=", 1)[1].lower() in {"1", "true"}
     return None
 
 
