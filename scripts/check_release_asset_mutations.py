@@ -70,8 +70,14 @@ _SHELL_PREFIX_TOKENS = {
     "exec",
     "command",
 }
+# Wrappers that run the following command; their leading ``-x`` options are skipped too.
+_WRAPPER_TOKENS = {"env", "sudo", "xargs", "nohup", "nice", "timeout"}
 _ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _SEPARATORS = re.compile(r"\n|&&|\|\||;|\||\$\(|`")
+_GHA_EXPRESSION = re.compile(r"\$\{\{.*?\}\}")
+_SUBSTITUTION = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+_EXPRESSION_PLACEHOLDER = "__GHA_EXPR__"
+_SUBSTITUTION_PLACEHOLDER = "__SUBST__"
 _WRITE_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
 _GH_API_BODY_FLAGS = {"-f", "-F", "--field", "--raw-field", "--input"}
 _CURL_BODY_FLAGS = {"-d", "--data", "--data-binary", "--data-raw", "-F", "--form", "-T"}
@@ -103,11 +109,14 @@ class ReleaseMutation:
 def split_shell_commands(script: str) -> list[str]:
     """Split a ``run`` script into simple command segments.
 
-    Backslash continuations are joined, full-line comments are dropped and the
-    script is split on newlines, ``;``, ``&&``, ``||``, pipes and command
-    substitution openers. Quoting is not honoured when splitting; this only
-    affects which segment a token lands in, not whether a command starts with
-    ``gh``/``curl``.
+    Backslash continuations are joined and full-line comments are dropped.
+    GitHub ``${{ ... }}`` expressions are replaced by a placeholder, and
+    innermost ``$(...)``/backtick substitutions are replaced by a placeholder
+    in the enclosing command while their contents are emitted as segments of
+    their own. The rest is split on newlines, ``;``, ``&&``, ``||``, pipes and
+    any remaining (nested) substitution openers. Quoting is not honoured when
+    splitting; this only affects which segment a token lands in, not whether a
+    command starts with ``gh``/``curl``.
     """
 
     joined = re.sub(r"\\\r?\n", " ", script)
@@ -115,10 +124,24 @@ def split_shell_commands(script: str) -> list[str]:
     for line in joined.splitlines():
         if line.strip().startswith("#"):
             continue
-        for part in _SEPARATORS.split(line):
-            text = " ".join(part.split())
-            if text:
-                segments.append(text)
+        pending = [_GHA_EXPRESSION.sub(_EXPRESSION_PLACEHOLDER, line)]
+        while pending:
+            text = pending.pop(0)
+            inner: list[str] = []
+
+            def _extract(match: re.Match[str], found: list[str] = inner) -> str:
+                found.append(match.group(1) if match.group(1) is not None else match.group(2))
+                return _SUBSTITUTION_PLACEHOLDER
+
+            previous = None
+            while previous != text:
+                previous = text
+                text = _SUBSTITUTION.sub(_extract, text)
+            for part in _SEPARATORS.split(text):
+                normalised = " ".join(part.split())
+                if normalised:
+                    segments.append(normalised)
+            pending.extend(inner)
     return segments
 
 
@@ -127,8 +150,16 @@ def _tokens(segment: str) -> list[str]:
         tokens = shlex.split(segment, comments=False)
     except ValueError:
         tokens = segment.split()
-    while tokens and (tokens[0] in _SHELL_PREFIX_TOKENS or _ENV_ASSIGNMENT.match(tokens[0])):
-        tokens = tokens[1:]
+    while tokens:
+        head = tokens[0]
+        if head in _SHELL_PREFIX_TOKENS or _ENV_ASSIGNMENT.match(head):
+            tokens = tokens[1:]
+        elif head.rsplit("/", 1)[-1] in _WRAPPER_TOKENS:
+            tokens = tokens[1:]
+            while tokens and tokens[0].startswith("-"):
+                tokens = tokens[1:]
+        else:
+            break
     return tokens
 
 
@@ -244,8 +275,17 @@ def _step_matches(step: Mapping[str, object]) -> list[_Match]:
 
 
 def _job_inventory(workflow: str, job: str, steps: Iterable[object]) -> list[ReleaseMutation]:
+    """Record every release write in a job, in order, with its draft/published target.
+
+    The draft window opens only on a ``--draft`` create in this job. It stays
+    open for uploads, asset deletions and edits that keep the draft, and closes
+    (fail closed) on ``--draft=false`` and on any other write whose effect on
+    the draft state is not positively known, such as ``gh api``/``curl``
+    writes. Every command is recorded, so repeated commands in one step are
+    counted rather than collapsed.
+    """
+
     entries: list[ReleaseMutation] = []
-    seen: set[tuple[str, str, str, str, bool]] = set()
     draft_open = False
     for index, step in enumerate(steps, start=1):
         if not isinstance(step, dict):
@@ -256,12 +296,15 @@ def _job_inventory(workflow: str, job: str, steps: Iterable[object]) -> list[Rel
             if match.kind == "create_release":
                 target = "draft" if draft else "published"
                 draft_open = draft
-            elif match.kind == "edit_release" and draft_open:
+            elif draft_open:
                 target = "draft"
-                if match.draft is False:
+                if match.kind == "edit_release":
+                    if match.draft is False:
+                        draft_open = False
+                elif match.kind not in {"upload_asset", "delete_asset"}:
                     draft_open = False
             else:
-                target = "draft" if draft_open else "published"
+                target = "published"
             entry = ReleaseMutation(
                 workflow=workflow,
                 job=job,
@@ -272,9 +315,6 @@ def _job_inventory(workflow: str, job: str, steps: Iterable[object]) -> list[Rel
                 target_state=target,
                 command=match.command,
             )
-            if entry.key in seen:
-                continue
-            seen.add(entry.key)
             entries.append(entry)
     return entries
 
@@ -303,9 +343,10 @@ def inventory(root: Path) -> list[ReleaseMutation]:
     return entries
 
 
-def _allowlist_key(
-    index: int, item: object, errors: list[str]
-) -> tuple[str, str, str, str, bool] | None:
+_Key = tuple[str, str, str, str, bool]
+
+
+def _allowlist_key(index: int, item: object, errors: list[str]) -> tuple[_Key, int] | None:
     prefix = f"actions-policy.json: {POLICY_KEY}[{index}]"
     if not isinstance(item, dict):
         errors.append(f"{prefix} must be an object")
@@ -325,16 +366,20 @@ def _allowlist_key(
     reason = item.get("reason")
     if not isinstance(reason, str) or not reason.strip():
         problems.append("reason must explain why the mutation is tolerated")
+    count = item.get("count", 1)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+        problems.append("count must be a positive integer (default 1)")
     if problems:
         errors.append(f"{prefix}: " + "; ".join(problems))
         return None
-    return (
+    key = (
         str(item["workflow"]),
         str(item["job"]),
         str(item["step"]),
         str(item["kind"]),
         bool(item["clobber"]),
     )
+    return key, int(count)
 
 
 def validate(entries: Iterable[ReleaseMutation], allowlist: object) -> list[str]:
@@ -344,24 +389,27 @@ def validate(entries: Iterable[ReleaseMutation], allowlist: object) -> list[str]
         return [f"actions-policy.json: {POLICY_KEY} must be a list"]
 
     errors: list[str] = []
-    allowed: dict[tuple[str, str, str, str, bool], int] = {}
+    allowed: dict[_Key, int] = {}
+    expected_counts: dict[_Key, int] = {}
     for index, item in enumerate(allowlist):
-        key = _allowlist_key(index, item, errors)
-        if key is None:
+        parsed = _allowlist_key(index, item, errors)
+        if parsed is None:
             continue
+        key, count = parsed
         if key in allowed:
             errors.append(
                 f"actions-policy.json: {POLICY_KEY}[{index}] duplicates entry {allowed[key]}"
             )
             continue
         allowed[key] = index
+        expected_counts[key] = count
 
-    matched: set[tuple[str, str, str, str, bool]] = set()
+    matched: dict[_Key, int] = {}
     for entry in entries:
         if entry.target_state != "published":
             continue
         if entry.key in allowed:
-            matched.add(entry.key)
+            matched[entry.key] = matched.get(entry.key, 0) + 1
             continue
         clobber = " with --clobber" if entry.clobber else ""
         errors.append(
@@ -373,10 +421,19 @@ def validate(entries: Iterable[ReleaseMutation], allowlist: object) -> list[str]
         )
 
     for key, index in sorted(allowed.items(), key=lambda pair: pair[1]):
-        if key in matched:
-            continue
         workflow, job, step, kind, uses_clobber = key
         clobber_text = str(uses_clobber).lower()
+        if key in matched:
+            if matched[key] != expected_counts[key]:
+                errors.append(
+                    f"actions-policy.json: {POLICY_KEY}[{index}] allows "
+                    f"{expected_counts[key]} command(s) but {workflow}:{job}:{step} has "
+                    f"{matched[key]} matching command(s) ({kind}, clobber={clobber_text}). "
+                    "A new post-publication mutation in an allowlisted step needs review; "
+                    f"migrate it to draft -> attach -> publish ({ISSUE}) or, if tolerated, "
+                    "set count to match. Lower count when a command is removed."
+                )
+            continue
         errors.append(
             f"actions-policy.json: {POLICY_KEY}[{index}] is stale: no published-release "
             f"mutation matches {workflow}:{job}:{step} ({kind}, clobber={clobber_text}). "
